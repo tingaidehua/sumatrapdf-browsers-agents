@@ -131,6 +131,30 @@ TempStr GetAppDataDirTemp() {
     return gAppDataDir.s;
 }
 
+TempStr GetLocalSumatraDataDirTemp() {
+    // Heavy / volatile state must not live under OneDrive (profile + cache can be GBs).
+    TempStr dir = GetSpecialFolderTemp(CSIDL_LOCAL_APPDATA, true);
+    if (dir) {
+        dir = path::JoinTemp(dir, kAppName);
+        if (dir::HasWriteAccess(dir) || dir::CreateAll(dir)) {
+            if (dir::HasWriteAccess(dir)) {
+                return dir;
+            }
+        }
+    }
+    // Portable / locked-down fallback: sibling of synced appdata.
+    TempStr fallback = path::JoinTemp(GetAppDataDirTemp(), StrL("local"));
+    dir::CreateAll(fallback);
+    return fallback;
+}
+
+TempStr GetPathInLocalSumatraDataDirTemp(Str name) {
+    if (!name) {
+        return {};
+    }
+    return path::JoinTemp(GetLocalSumatraDataDirTemp(), name);
+}
+
 // Generate full path for a file or directory for storing data
 TempStr GetPathInAppDataDirTemp(Str name) {
     if (!name) {

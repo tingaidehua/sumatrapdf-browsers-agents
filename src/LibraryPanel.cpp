@@ -4,6 +4,7 @@
 #include "base/Base.h"
 #include "base/DirScan.h"
 #include "base/File.h"
+#include "base/Timer.h"
 #include "base/Win.h"
 #include "base/UITask.h"
 
@@ -16,6 +17,7 @@
 #include "gui/VirtCtrl.h"
 
 #include "Settings.h"
+#include "SumatraConfig.h"
 #include "AppSettings.h"
 #include "AppTools.h"
 #include "DisplayMode.h"
@@ -85,6 +87,19 @@ struct LibraryTreeModel : TreeModel {
     bool IsChecked(TreeItem) override { return false; }
     void SetUserData(TreeItem item, uintptr_t data) override { ((LibraryTreeItem*)item)->userData = data; }
     uintptr_t GetUserData(TreeItem item) override { return ((LibraryTreeItem*)item)->userData; }
+    i64 StableKey(TreeItem ti) override {
+        auto* item = (LibraryTreeItem*)ti;
+        switch (item->kind) {
+            case LibraryTreeKind::Collection:
+                return item->collectionId * 4 + 1;
+            case LibraryTreeKind::Book:
+                return item->bookId * 4 + 2;
+            case LibraryTreeKind::Error:
+                return 3;
+            default:
+                return 0;
+        }
+    }
 
     LibraryTreeItem* root = nullptr;
 };
@@ -98,28 +113,49 @@ static LibraryTreeItem* NewItem(LibraryTreeItem* parent, LibraryTreeKind kind, S
     return item;
 }
 
-static void AddBooks(LibraryTreeItem* parent, LibraryBookScope scope, i64 collectionId, Str filter) {
-    Vec<LibraryBook*> books = LibraryStoreGetBooks(LibraryGetStore(), scope, collectionId, LibrarySort::Manual, filter);
-    for (LibraryBook* book : books) {
-        TempStr label = book->title;
-        if (book->kind == LibraryBookKind::Web) {
-            Str url = book->url ? book->url : book->path;
-            // Prefer stored tab title; fall back to full URL only until title syncs.
-            bool titleIsUrl = label && (str::StartsWithI(label, StrL("http://")) ||
-                                        str::StartsWithI(label, StrL("https://")));
-            if (!label || titleIsUrl) {
-                label = url;
-            }
-            label = fmt("🌐 %s", label ? label : StrL("网页"));
+static void AddBookItem(LibraryTreeItem* parent, LibraryBook* book) {
+    TempStr label = book->title;
+    if (book->kind == LibraryBookKind::Web) {
+        Str url = book->url ? book->url : book->path;
+        // Prefer stored tab title; fall back to full URL only until title syncs.
+        bool titleIsUrl =
+            label && (str::StartsWithI(label, StrL("http://")) || str::StartsWithI(label, StrL("https://")));
+        if (!label || titleIsUrl) {
+            label = url;
         }
-        auto* item = NewItem(parent, LibraryTreeKind::Book, label);
-        item->bookId = book->id;
-        item->path = str::Dup(book->path);
-        item->url = str::Dup(book->url);
-        item->bookKind = book->kind;
-        item->bgColor = book->bgColor;
+        label = fmt("🌐 %s", label ? label : StrL("网页"));
     }
-    DeleteLibraryBooks(books);
+    auto* item = NewItem(parent, LibraryTreeKind::Book, label);
+    item->bookId = book->id;
+    item->path = book->path;
+    item->url = book->url;
+    item->bookKind = book->kind;
+    item->bgColor = book->bgColor;
+    // ownership moved to the tree item
+    book->path = Str();
+    book->url = Str();
+}
+
+struct CollectionIdIndex {
+    i64 id;
+    LibraryTreeItem* item;
+};
+
+static LibraryTreeItem* FindCollectionItem(Vec<CollectionIdIndex>& index, i64 id) {
+    int lo = 0;
+    int hi = len(index) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (index[mid].id == id) {
+            return index[mid].item;
+        }
+        if (index[mid].id < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return nullptr;
 }
 
 static void PruneEmptyCollections(LibraryTreeItem* parent) {
@@ -149,6 +185,7 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
 
     Vec<LibraryCollection*> collections = LibraryStoreGetCollections(LibraryGetStore());
     Vec<LibraryTreeItem*> collectionItems;
+    Vec<CollectionIdIndex> byId;
     for (LibraryCollection* collection : collections) {
         auto* item = new LibraryTreeItem();
         item->kind = LibraryTreeKind::Collection;
@@ -161,29 +198,40 @@ static LibraryTreeModel* BuildModel(MainWindow* win, Str filter) {
                    : (!win->libraryExpansionInitialized ? collection->isShelf
                                                         : win->expandedLibraryCollections.Contains(collection->id));
         collectionItems.Append(item);
+        byId.Append({collection->id, item});
     }
+    VecSort(byId, [](const CollectionIdIndex* a, const CollectionIdIndex* b) -> int {
+        return (a->id > b->id) - (a->id < b->id);
+    });
     // Phase 1: attach all folders first so siblings always list folders above PDFs.
     for (int i = 0; i < len(collections); i++) {
         LibraryCollection* collection = collections[i];
         LibraryTreeItem* item = collectionItems[i];
-        LibraryTreeItem* parent = model->root;
-        if (collection->parentId) {
-            for (int j = 0; j < len(collections); j++) {
-                if (collections[j]->id == collection->parentId) {
-                    parent = collectionItems[j];
-                    break;
-                }
-            }
+        LibraryTreeItem* parent = collection->parentId ? FindCollectionItem(byId, collection->parentId) : nullptr;
+        if (!parent) {
+            parent = model->root;
         }
         item->parent = parent;
         parent->children.Append(item);
     }
-    // Phase 2: append books under each folder / root (after all child folders).
-    for (int i = 0; i < len(collections); i++) {
-        AddBooks(collectionItems[i], LibraryBookScope::Collection, collections[i]->id, filter);
-    }
     DeleteLibraryCollections(collections);
-    AddBooks(model->root, LibraryBookScope::ManualRoot, 0, filter);
+    // Phase 2: append books under each folder / root (after all child folders).
+    Vec<LibraryBook*> books = LibraryStoreGetPlacedBooks(LibraryGetStore(), filter);
+    for (LibraryBook* book : books) {
+        LibraryTreeItem* parent = book->placementId ? FindCollectionItem(byId, book->placementId) : model->root;
+        if (parent) {
+            AddBookItem(parent, book);
+        }
+    }
+    // A broad filter ("a") matches most of a huge library; auto-expanding would insert every
+    // row into the TreeView. Leave folders collapsed (lazily filled) until the filter narrows.
+    constexpr int kFilterAutoExpandMaxBooks = 2000;
+    if (filter && len(books) > kFilterAutoExpandMaxBooks) {
+        for (LibraryTreeItem* item : collectionItems) {
+            item->expanded = false;
+        }
+    }
+    DeleteLibraryBooks(books);
     if (filter) {
         PruneEmptyCollections(model->root);
     }
@@ -195,11 +243,18 @@ static TempStr FilterTextTemp(MainWindow* win) {
 }
 
 static void RememberExpandedCollectionsRec(MainWindow* win, LibraryTreeItem* item) {
-    if (item->kind == LibraryTreeKind::Collection && win->libraryTreeView->IsExpanded((TreeItem)item)) {
-        win->expandedLibraryCollections.Append(item->collectionId);
+    if (item->kind == LibraryTreeKind::Collection) {
+        // lazily inserted tree: rows under a never-expanded folder have no handle, keep their model state
+        TreeView* tv = win->libraryTreeView;
+        bool expanded = tv->GetHandleByTreeItem((TreeItem)item) ? tv->IsExpanded((TreeItem)item) : item->expanded;
+        if (expanded) {
+            win->expandedLibraryCollections.Append(item->collectionId);
+        }
     }
     for (LibraryTreeItem* child : item->children) {
-        RememberExpandedCollectionsRec(win, child);
+        if (child->kind == LibraryTreeKind::Collection) {
+            RememberExpandedCollectionsRec(win, child);
+        }
     }
 }
 
@@ -368,6 +423,8 @@ void SyncLibrarySelection(MainWindow* win) {
     TreeView_EnsureVisible(win->libraryTreeView->hwnd, hi);
 }
 
+static char gLastLibraryRefreshTiming[160];
+
 void RefreshLibraryPanel(MainWindow* win) {
     if (!win || !win->libraryTreeView) return;
     logf("RefreshLibraryPanel: begin\n");
@@ -376,17 +433,32 @@ void RefreshLibraryPanel(MainWindow* win) {
     win->libraryDropItem = 0;
     win->libraryDragging = false;
     win->libraryDropAfter = false;
+    win->libraryDropInto = false;
     win->libraryMultiSelected.Reset();
     win->librarySelectAnchor = 0;
+    TimeStamp t0 = TimeGet();
     RememberExpandedCollections(win);
+    double rememberMs = TimeSinceInMs(t0);
     TempStr filter = FilterTextTemp(win);
     TreeModel* previous = win->libraryTreeView->treeModel;
-    win->libraryTreeView->SetTreeModel(BuildModel(win, filter));
+    t0 = TimeGet();
+    LibraryTreeModel* model = BuildModel(win, filter);
+    double buildMs = TimeSinceInMs(t0);
+    t0 = TimeGet();
+    win->libraryTreeView->SetTreeModel(model);
+    double populateMs = TimeSinceInMs(t0);
     win->libraryModelFiltered = !!filter;
     win->libraryExpansionInitialized = true;
+    t0 = TimeGet();
     delete previous;
+    double freeMs = TimeSinceInMs(t0);
+    t0 = TimeGet();
     SyncLibrarySelection(win);
-    logf("RefreshLibraryPanel: end\n");
+    double syncMs = TimeSinceInMs(t0);
+    snprintf(gLastLibraryRefreshTiming, sizeof(gLastLibraryRefreshTiming),
+             "remember=%.1f build=%.1f populate=%.1f free=%.1f sync=%.1f", rememberMs, buildMs, populateMs, freeMs,
+             syncMs);
+    logf("RefreshLibraryPanel: end %s ms\n", Str(gLastLibraryRefreshTiming));
 }
 
 void RefreshLibraryPanels() {
@@ -429,8 +501,23 @@ void LibraryUpdateWebBookTabTitle(i64 bookId, Str title) {
     }
 }
 
+constexpr UINT_PTR kLibraryFilterTimerId = 0x4c46;
+constexpr UINT kLibraryFilterDelayMs = 150;
+
+static void CALLBACK OnLibraryFilterTimer(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+    KillTimer(hwnd, id);
+    MainWindow* win = FindMainWindowByHwnd(hwnd);
+    if (win && win->libraryTreeView && win->libraryTreeView->hwnd == hwnd) {
+        RefreshLibraryPanel(win);
+    }
+}
+
+// Rebuilding a 10k-row tree per keystroke stalls typing; refresh once typing pauses.
 static void OnFilterChanged(MainWindow* win) {
-    RefreshLibraryPanel(win);
+    if (!win || !win->libraryTreeView || !win->libraryTreeView->hwnd) {
+        return;
+    }
+    SetTimer(win->libraryTreeView->hwnd, kLibraryFilterTimerId, kLibraryFilterDelayMs, OnLibraryFilterTimer);
 }
 
 static void OpenLibraryItem(MainWindow* source, LibraryTreeItem* item) {
@@ -459,6 +546,35 @@ static void OpenLibraryItem(MainWindow* source, LibraryTreeItem* item) {
     LibraryOnActiveBookChanged(source, item->bookId, (int)LibraryBookKind::Pdf);
 }
 
+constexpr UINT_PTR kLibraryOpenTimerId = 0x4c4f;
+static int gLibraryTimerOpens = 0;
+
+static void CALLBACK OnLibraryOpenTimer(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+    KillTimer(hwnd, id);
+    MainWindow* win = FindMainWindowByHwnd(hwnd);
+    if (!win || !win->libraryTreeView || win->libraryTreeView->hwnd != hwnd) {
+        return;
+    }
+    i64 bookId = win->libraryPendingOpenBookId;
+    win->libraryPendingOpenBookId = 0;
+    gLibraryTimerOpens++;
+    auto* model = (LibraryTreeModel*)win->libraryTreeView->treeModel;
+    LibraryTreeItem* item = model && bookId > 0 ? FindBookById(model->root, bookId) : nullptr;
+    OpenLibraryItem(win, item);
+}
+
+// A switch can take a few hundred ms (tab switch, WebView surfaces). Opening from
+// WM_TIMER, which is only delivered once no input or paint is pending, lets queued
+// clicks all update the selection first; then only the last clicked book opens.
+static void ScheduleOpenLibraryItem(MainWindow* win, LibraryTreeItem* item) {
+    if (!item || item->bookId <= 0 || !win->libraryTreeView->hwnd) {
+        OpenLibraryItem(win, item);
+        return;
+    }
+    win->libraryPendingOpenBookId = item->bookId;
+    SetTimer(win->libraryTreeView->hwnd, kLibraryOpenTimerId, 0, OnLibraryOpenTimer);
+}
+
 static void OnTreeTooltip(TreeView::GetTooltipEvent* ev) {
     auto* item = (LibraryTreeItem*)ev->treeItem;
     if (!item) {
@@ -484,18 +600,60 @@ static void SplitBookLabel(LibraryTreeItem* item, Str& stem, Str& ext) {
     ext = item && item->path && str::EndsWithI(item->path, StrL(".pdf")) ? StrL(".pdf") : Str();
 }
 
-static void DrawLibraryFade(Gfx* gfx, Rect rc, Color bg) {
+static bool IsCtrlDown() {
+    return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+}
+
+// Runs for every truncated visible row on each paint, so it is one AlphaBlend of a
+// cached 1px-high premultiplied ramp; a GDI+ Graphics per step made scrolling lag.
+static void DrawLibraryFade(HDC hdc, Rect rc, Color bg) {
     int fadeDx = std::min(rc.dx, DpiScale(22));
-    if (fadeDx <= 0) {
+    if (fadeDx <= 0 || rc.dy <= 0) {
         return;
     }
-    constexpr int kSteps = 8;
-    for (int i = 0; i < kSteps; i++) {
-        int x0 = rc.x + rc.dx - fadeDx + fadeDx * i / kSteps;
-        int x1 = rc.x + rc.dx - fadeDx + fadeDx * (i + 1) / kSteps;
-        Rect strip{x0, rc.y, std::max(1, x1 - x0), rc.dy};
-        gfx->FillRects(&strip, 1, bg, (u8)(255 * (i + 1) / kSteps));
+    static HDC memDc = nullptr;
+    static HBITMAP bmp = nullptr;
+    static u32* bits = nullptr;
+    static int bmpDx = 0;
+    static int rampDx = 0;
+    static Color rampBg = 0;
+    if (fadeDx > bmpDx) {
+        if (!memDc) {
+            memDc = CreateCompatibleDC(nullptr);
+        }
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+        bmi.bmiHeader.biWidth = fadeDx;
+        bmi.bmiHeader.biHeight = 1;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        void* p = nullptr;
+        HBITMAP newBmp = CreateDIBSection(memDc, &bmi, DIB_RGB_COLORS, &p, nullptr, 0);
+        if (!newBmp || !memDc) {
+            return;
+        }
+        SelectObject(memDc, newBmp);
+        if (bmp) {
+            DeleteObject(bmp);
+        }
+        bmp = newBmp;
+        bits = (u32*)p;
+        bmpDx = fadeDx;
+        rampDx = 0;
     }
+    if (rampDx != fadeDx || rampBg != bg) {
+        u32 r = GetRValue(bg), g = GetGValue(bg), b = GetBValue(bg);
+        for (int x = 0; x < fadeDx; x++) {
+            u32 a = 255u * (u32)(x + 1) / (u32)fadeDx;
+            bits[x] = (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255);
+        }
+        GdiFlush();
+        rampDx = fadeDx;
+        rampBg = bg;
+    }
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    AlphaBlend(hdc, rc.x + rc.dx - fadeDx, rc.y, fadeDx, rc.dy, memDc, 0, 0, fadeDx, 1, bf);
 }
 
 static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
@@ -529,8 +687,12 @@ static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
         }
     }
     bool isDrop = win && win->libraryDropItem && win->libraryDropItem == (uintptr_t)item;
-    bool dropAsSibling = isDrop && item->kind == LibraryTreeKind::Book && win->libraryDragItem &&
-                         ((LibraryTreeItem*)win->libraryDragItem)->kind == LibraryTreeKind::Book;
+    auto* dragSrc = win && win->libraryDragItem ? (LibraryTreeItem*)win->libraryDragItem : nullptr;
+    bool dropAsSibling =
+        isDrop && dragSrc &&
+        ((item->kind == LibraryTreeKind::Book && dragSrc->kind == LibraryTreeKind::Book) ||
+         (item->kind == LibraryTreeKind::Collection && dragSrc->kind == LibraryTreeKind::Collection &&
+          !win->libraryDropInto));
     bool hasFocus = isSelected && GetFocus() == tv->hwnd;
     Color bgCol, txtCol;
     ResolveTreeFilterItemColors(hdc, itemRect, tv->bgColor, tv->textColor, isSelected || (isDrop && !dropAsSibling),
@@ -575,7 +737,7 @@ static void DrawLibraryItem(TreeView::CustomDrawEvent* ev, MainWindow* win) {
             RestoreDC(hdc, saved);
         }
         if (stemSize.dx > stemRect.dx) {
-            DrawLibraryFade(&gfx, stemRect, bgCol);
+            DrawLibraryFade(hdc, stemRect, bgCol);
         }
         if (ext) {
             Rect extRect = textRect;
@@ -610,6 +772,9 @@ static void OnLibraryCustomDraw(TreeView::CustomDrawEvent* ev) {
     if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
         // Hide the default label; we paint stem + pinned extension ourselves.
         ev->nm->clrText = ev->nm->clrTextBk;
+        // Suppress the themed selection/hover box: it spans the full row, and the part left of
+        // our painted label showed up as a bordered tab. DrawLibraryItem re-derives selection.
+        cd->uItemState &= ~(CDIS_SELECTED | CDIS_FOCUS | CDIS_HOT);
         ev->result = CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT;
         return;
     }
@@ -632,12 +797,23 @@ static i64 CollectionIdForItem(LibraryTreeItem* item) {
     return 0;
 }
 
-static void SetLibraryDropItem(MainWindow* win, TreeItem item, bool dropAfter) {
-    if (!win || (win->libraryDropItem == (uintptr_t)item && win->libraryDropAfter == dropAfter)) {
+static bool IsLibraryItemInside(LibraryTreeItem* item, LibraryTreeItem* ancestor) {
+    for (LibraryTreeItem* it = item; it; it = it->parent) {
+        if (it == ancestor) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void SetLibraryDropItem(MainWindow* win, TreeItem item, bool dropAfter, bool dropInto = false) {
+    if (!win || (win->libraryDropItem == (uintptr_t)item && win->libraryDropAfter == dropAfter &&
+                 win->libraryDropInto == dropInto)) {
         return;
     }
     win->libraryDropItem = (uintptr_t)item;
     win->libraryDropAfter = dropAfter;
+    win->libraryDropInto = dropInto;
     if (win->libraryTreeView) {
         HwndInvalidate(win->libraryTreeView->hwnd);
     }
@@ -660,9 +836,13 @@ enum {
     kLibraryMenuScriptManager,
     kLibraryMenuViewAiTabs,
     kLibraryMenuCloseWebTab,
+    kLibraryMenuNewTag,
+    kLibraryMenuRetagRoot,
     kLibraryMenuColorNone,
     kLibraryMenuColorFirst,
 };
+// one id per folder in the "添加标签" submenu; above the color swatch ids
+constexpr int kLibraryMenuTagFirst = 1000;
 
 // Pale Song-dynasty inspired row tints (flat, low chroma). Values are 0x00RRGGBB.
 struct LibraryBgSwatch {
@@ -734,6 +914,144 @@ static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
 
 static Str PromptLibraryText(HWND parent, Str title, Str label);
 static bool CreateNamedCollection(MainWindow* win, i64 parentId, bool isShelf);
+
+static bool CollectionExists(Vec<LibraryCollection*>& cols, i64 id) {
+    for (LibraryCollection* c : cols) {
+        if (c->id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// checkedIds: shown checked and inert; disabledIds: greyed out
+static void AppendTagMenuLevel(HMENU menu, Vec<LibraryCollection*>& cols, i64 parentId, int depth,
+                               Vec<i64>& checkedIds, Vec<i64>& menuTagIds, Vec<i64>* disabledIds = nullptr) {
+    if (depth > 32) {
+        return;
+    }
+    for (LibraryCollection* c : cols) {
+        bool atLevel = depth == 0 ? (c->parentId == 0 || !CollectionExists(cols, c->parentId)) : c->parentId == parentId;
+        if (!atLevel) {
+            continue;
+        }
+        str::Builder label;
+        for (int i = 0; i < depth; i++) {
+            label.Append(StrL("\xe3\x80\x80\xe3\x80\x80")); // two ideographic spaces per level
+        }
+        label.Append(StrL("📁 "));
+        Str name = c->name ? c->name : StrL("");
+        for (int i = 0; i < len(name); i++) {
+            // '&' would turn into a menu mnemonic
+            if (name.s[i] == '&') {
+                label.AppendChar('&');
+            }
+            label.AppendChar(name.s[i]);
+        }
+        UINT flags = MF_STRING;
+        if (checkedIds.Contains(c->id)) {
+            flags |= MF_CHECKED | MF_GRAYED;
+        } else if (disabledIds && disabledIds->Contains(c->id)) {
+            flags |= MF_GRAYED;
+        }
+        AppendMenuW(menu, flags, kLibraryMenuTagFirst + len(menuTagIds), CWStrTemp(ToStr(label)));
+        menuTagIds.Append(c->id);
+        AppendTagMenuLevel(menu, cols, c->id, depth + 1, checkedIds, menuTagIds, disabledIds);
+    }
+}
+
+// Folder "修改标签": the folder (tag X) moves under the picked folder T, so its books become
+// tagged "T/X". The folder itself
+// is checked (picking it does nothing); its own sub-folders are greyed out (would be a cycle).
+static void AppendCollectionRetagMenu(HMENU parent, i64 collectionId, Vec<i64>& menuTagIds) {
+    HMENU tagMenu = CreatePopupMenu();
+    Vec<LibraryCollection*> cols = LibraryStoreGetCollections(LibraryGetStore());
+    Vec<i64> self;
+    self.Append(collectionId);
+    Vec<i64> descendants;
+    Vec<i64> frontier;
+    frontier.Append(collectionId);
+    while (len(frontier) > 0) {
+        i64 id = frontier.Pop();
+        for (LibraryCollection* c : cols) {
+            if (c->parentId == id && !descendants.Contains(c->id)) {
+                descendants.Append(c->id);
+                frontier.Append(c->id);
+            }
+        }
+    }
+    i64 parentId = 0;
+    for (LibraryCollection* c : cols) {
+        if (c->id == collectionId) {
+            parentId = c->parentId;
+        }
+    }
+    AppendMenuW(tagMenu, parentId == 0 ? MF_STRING | MF_CHECKED | MF_GRAYED : MF_STRING, kLibraryMenuRetagRoot,
+                CWStrTemp(_TRA("图书馆（顶层）")));
+    AppendMenuW(tagMenu, MF_SEPARATOR, 0, nullptr);
+    AppendTagMenuLevel(tagMenu, cols, 0, 0, self, menuTagIds, &descendants);
+    DeleteLibraryCollections(cols);
+    AppendMenuW(parent, MF_POPUP, (UINT_PTR)tagMenu, CWStrTemp(_TRA("修改标签")));
+}
+
+// Folders are tags: menuTagIds[cmd - kLibraryMenuTagFirst] is the folder picked
+static void AppendLibraryTagMenu(HMENU parent, i64 bookId, Vec<i64>& menuTagIds) {
+    HMENU tagMenu = CreatePopupMenu();
+    AppendMenuW(tagMenu, MF_STRING, kLibraryMenuNewTag, CWStrTemp(_TRA("新建标签...")));
+    Vec<LibraryCollection*> cols = LibraryStoreGetCollections(LibraryGetStore());
+    if (len(cols) > 0) {
+        AppendMenuW(tagMenu, MF_SEPARATOR, 0, nullptr);
+        Vec<i64> bookTags = LibraryStoreGetBookCollectionIds(LibraryGetStore(), bookId);
+        AppendTagMenuLevel(tagMenu, cols, 0, 0, bookTags, menuTagIds);
+    }
+    DeleteLibraryCollections(cols);
+    AppendMenuW(parent, MF_POPUP, (UINT_PTR)tagMenu, CWStrTemp(_TRA("添加标签")));
+}
+
+static bool AddLibraryBookTag(MainWindow* win, i64 bookId, i64 collectionId) {
+    if (!LibraryStoreAddBookTag(LibraryGetStore(), bookId, collectionId)) {
+        MessageBoxW(win->hwndFrame, CWStrTemp(fmt("%s\n%s", _TRA("添加标签失败。"), LibraryGetError())),
+                    CWStrTemp(_TRA("添加标签")), MB_OK | MB_ICONERROR);
+        return false;
+    }
+    return true;
+}
+
+static LibraryTreeItem* FindCollectionItemRec(LibraryTreeItem* item, i64 collectionId) {
+    if (item->kind == LibraryTreeKind::Collection && item->collectionId == collectionId) {
+        return item;
+    }
+    for (LibraryTreeItem* child : item->children) {
+        if (child->kind == LibraryTreeKind::Collection || child->kind == LibraryTreeKind::Root) {
+            LibraryTreeItem* found = FindCollectionItemRec(child, collectionId);
+            if (found) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// after a refresh: expand down to the book inside the folder it was just tagged with
+static void RevealBookInCollection(MainWindow* win, i64 collectionId, i64 bookId) {
+    TreeView* tv = win->libraryTreeView;
+    auto* model = tv ? (LibraryTreeModel*)tv->treeModel : nullptr;
+    LibraryTreeItem* col = model ? FindCollectionItemRec(model->root, collectionId) : nullptr;
+    if (!col) {
+        return;
+    }
+    LibraryTreeItem* target = col;
+    for (LibraryTreeItem* child : col->children) {
+        if (child->kind == LibraryTreeKind::Book && child->bookId == bookId) {
+            target = child;
+            break;
+        }
+    }
+    HTREEITEM hi = tv->EnsureHandleByTreeItem((TreeItem)target);
+    if (hi) {
+        TreeView_EnsureVisible(tv->hwnd, hi);
+    }
+}
 
 static void UpdateOpenTabsAfterRename(Str oldPath, Str newPath) {
     if (!oldPath || !newPath) {
@@ -888,6 +1206,7 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
     if (!item) return;
     HMENU menu = CreatePopupMenu();
     Vec<HBITMAP> swatchBitmaps;
+    Vec<i64> menuTagIds;
     if (item->kind == LibraryTreeKind::Book) {
         const bool isWeb = item->bookKind == LibraryBookKind::Web;
         if (!isWeb && item->path) {
@@ -900,6 +1219,9 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
                 AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CWStrTemp(sizeLabel));
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             }
+        }
+        if (item->bookId > 0) {
+            AppendLibraryTagMenu(menu, item->bookId, menuTagIds);
         }
         if (isWeb) {
             AppendMenuW(menu, MF_STRING, kLibraryMenuCopyFilePath, CWStrTemp(_TRA("复制 URL")));
@@ -928,6 +1250,9 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kLibraryMenuNewCategory, CWStrTemp(_TRA("新建子文件夹")));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        if (item->collectionId > 0) {
+            AppendCollectionRetagMenu(menu, item->collectionId, menuTagIds);
+        }
         AppendLibraryColorMenu(menu, swatchBitmaps);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kLibraryMenuRenameCollection, CWStrTemp(_TRA("重命名文件夹")));
@@ -941,6 +1266,7 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
         DeleteObject(hbmp);
     }
     bool changed = false;
+    i64 revealTagId = 0;
     if (cmd == kLibraryMenuOpenFolder) {
         if (item->bookKind != LibraryBookKind::Web && item->path) {
             SumatraOpenPathInDefaultFileManager(item->path);
@@ -1101,8 +1427,49 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
         }
     } else if (cmd == kLibraryMenuNewCategory) {
         changed = CreateNamedCollection(win, item->collectionId, false);
+    } else if (cmd == kLibraryMenuNewTag) {
+        Str name = PromptLibraryText(win->hwndFrame, _TRA("新建标签"), _TRA("标签名称（会创建同名文件夹）"));
+        if (name && item->bookId > 0) {
+            LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), 0, false, name);
+            if (created) {
+                if (AddLibraryBookTag(win, item->bookId, created->id)) {
+                    revealTagId = created->id;
+                }
+                DeleteLibraryCollection(created);
+                changed = true;
+            } else {
+                MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("无法创建标签文件夹。")), CWStrTemp(_TRA("新建标签")),
+                            MB_OK | MB_ICONWARNING);
+            }
+        }
+        str::Free(name);
+    } else if ((cmd >= kLibraryMenuTagFirst && cmd < kLibraryMenuTagFirst + len(menuTagIds)) ||
+               cmd == kLibraryMenuRetagRoot) {
+        i64 tagId = cmd == kLibraryMenuRetagRoot ? 0 : menuTagIds[cmd - kLibraryMenuTagFirst];
+        if (item->kind == LibraryTreeKind::Collection) {
+            if (tagId != item->collectionId) {
+                changed = LibraryStoreRetagCollection(LibraryGetStore(), item->collectionId, tagId);
+                if (changed) {
+                    // gone if it merged into a same-named folder; the reveal is then a no-op
+                    revealTagId = item->collectionId;
+                } else {
+                    MessageBoxW(win->hwndFrame, CWStrTemp(fmt("%s\n%s", _TRA("修改标签失败。"), LibraryGetError())),
+                                CWStrTemp(_TRA("修改标签")), MB_OK | MB_ICONERROR);
+                }
+            }
+        } else {
+            changed = AddLibraryBookTag(win, item->bookId, tagId);
+            if (changed) {
+                revealTagId = tagId;
+            }
+        }
     }
+    // item belongs to the model that the refresh deletes
+    i64 revealBookId = item->bookId;
     if (changed) RefreshLibraryPanels();
+    if (revealTagId > 0) {
+        RevealBookInCollection(win, revealTagId, revealBookId);
+    }
 }
 
 static HCURSOR gLibraryCursorMove = nullptr;
@@ -1192,10 +1559,6 @@ static void EnsureLibraryDragCursors() {
     if (!gLibraryCursorCopy) {
         gLibraryCursorCopy = CreateLibraryDragCursor(true);
     }
-}
-
-static bool IsCtrlDown() {
-    return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
 }
 
 static void ClearLibraryMultiSelection(MainWindow* win) {
@@ -1333,6 +1696,31 @@ static void UpdateLibraryDragCursor() {
     SetCursor(cur);
 }
 
+static void LibrarySelectTreeItemNoScrollJump(TreeView* tv, TreeItem ti) {
+    if (!tv || !tv->hwnd || ti == TreeModel::kNullItem) {
+        return;
+    }
+    HWND hwnd = tv->hwnd;
+    HTREEITEM hi = tv->GetHandleByTreeItem(ti);
+    HTREEITEM first = TreeView_GetFirstVisible(hwnd);
+    RECT itemRc{};
+    RECT clientRc{};
+    bool fullyVisible = hi && TreeView_GetItemRect(hwnd, hi, &itemRc, FALSE) && GetClientRect(hwnd, &clientRc) &&
+                        itemRc.top >= 0 && itemRc.bottom <= clientRc.bottom;
+    tv->SelectItem(ti);
+    // TreeView_SelectItem can scroll a mid-list folder to the top; pin scroll back.
+    if (fullyVisible && first && TreeView_GetItemRect(hwnd, first, &itemRc, FALSE)) {
+        HTREEITEM hSel = TreeView_GetSelection(hwnd);
+        SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+        TreeView_SelectSetFirstVisible(hwnd, first);
+        if (hSel) {
+            TreeView_SelectItem(hwnd, hSel);
+        }
+        SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(hwnd, nullptr, TRUE);
+    }
+}
+
 static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
     MainWindow* win = (MainWindow*)data;
     if (msg == WM_LBUTTONDOWN && win && win->libraryTreeView) {
@@ -1372,7 +1760,7 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
                 win->librarySelectAnchor = (uintptr_t)item;
             }
             win->libraryDragItem = (uintptr_t)item;
-            win->libraryTreeView->SelectItem((TreeItem)item);
+            LibrarySelectTreeItemNoScrollJump(win->libraryTreeView, (TreeItem)item);
             HwndInvalidate(hwnd);
             SetFocus(hwnd);
             return 0;
@@ -1381,7 +1769,7 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         ClearLibraryMultiSelection(win);
         win->libraryDragItem = item ? (uintptr_t)item : 0;
         if (item) {
-            win->libraryTreeView->SelectItem((TreeItem)item);
+            LibrarySelectTreeItemNoScrollJump(win->libraryTreeView, (TreeItem)item);
         }
         HwndInvalidate(hwnd);
         return DefSubclassProc(hwnd, msg, wp, lp);
@@ -1415,20 +1803,42 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
                 SendMessageW(hwnd, WM_VSCROLL, SB_LINEDOWN, 0);
             }
             auto* hover = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
-            if (hover && hover->kind == LibraryTreeKind::Collection) {
+            auto* dragSrc = (LibraryTreeItem*)win->libraryDragItem;
+            bool draggingFolder = dragSrc && dragSrc->kind == LibraryTreeKind::Collection;
+            bool folderOnFolder = draggingFolder && hover && hover->kind == LibraryTreeKind::Collection;
+            if (folderOnFolder && IsLibraryItemInside(hover, dragSrc)) {
+                hover = nullptr; // a folder cannot go into itself or its own sub-folders
+                folderOnFolder = false;
+            }
+            Rect itemRc{};
+            bool haveRc = hover && win->libraryTreeView->GetItemRect((TreeItem)hover, false, itemRc) && itemRc.dy > 0;
+            int mouseY = GET_Y_LPARAM(lp);
+            bool dropAfter = false;
+            bool dropInto = false;
+            if (folderOnFolder) {
+                // Explorer-style zones: top/bottom quarter = reorder beside it, middle = into it.
+                int quarter = haveRc ? itemRc.dy / 4 : 0;
+                if (IsCtrlDown() || !haveRc) {
+                    dropInto = true;
+                } else if (mouseY < itemRc.y + quarter) {
+                    dropAfter = false;
+                } else if (mouseY >= itemRc.y + itemRc.dy - quarter) {
+                    dropAfter = true;
+                } else {
+                    dropInto = true;
+                }
+            } else if (hover && hover->kind == LibraryTreeKind::Book && haveRc) {
+                dropAfter = mouseY >= itemRc.y + itemRc.dy / 2;
+            }
+            // Auto-expand a folder when something is about to be dropped into it.
+            if (hover && hover->kind == LibraryTreeKind::Collection &&
+                (dropInto || (dragSrc && dragSrc->kind == LibraryTreeKind::Book))) {
                 HTREEITEM hi = win->libraryTreeView->GetHandleByTreeItem((TreeItem)hover);
                 if (hi) {
                     TreeView_Expand(hwnd, hi, TVE_EXPAND);
                 }
             }
-            bool dropAfter = false;
-            if (hover && hover->kind == LibraryTreeKind::Book) {
-                Rect itemRc{};
-                if (win->libraryTreeView->GetItemRect((TreeItem)hover, false, itemRc) && itemRc.dy > 0) {
-                    dropAfter = GET_Y_LPARAM(lp) >= itemRc.y + itemRc.dy / 2;
-                }
-            }
-            SetLibraryDropItem(win, (TreeItem)hover, dropAfter);
+            SetLibraryDropItem(win, (TreeItem)hover, dropAfter, dropInto);
             return 0;
         }
     }
@@ -1443,13 +1853,16 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         auto* source = (LibraryTreeItem*)win->libraryDragItem;
         auto* target = (LibraryTreeItem*)win->libraryDropItem;
         bool dropAfter = win->libraryDropAfter;
-        if (!target) {
+        bool dropInto = win->libraryDropInto;
+        // while dragging, no drop item means the hovered row refused the drop
+        if (!target && !win->libraryDragging) {
             target = (LibraryTreeItem*)win->libraryTreeView->GetItemAt(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
         }
         bool wasDragging = win->libraryDragging;
         bool filtered = win->libraryModelFiltered;
         bool copy = IsCtrlDown(); // Ctrl = add tag (keep source membership)
         bool changed = false;
+        i64 revealCollectionId = 0;
         if (wasDragging && source && source != target && !filtered) {
             Vec<LibraryTreeItem*> books;
             GetLibraryDragBooks(win, source, &books);
@@ -1482,13 +1895,34 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
                     }
                 }
             } else if (source->kind == LibraryTreeKind::Collection) {
-                i64 newParent = 0;
                 if (target && target->kind == LibraryTreeKind::Collection) {
-                    newParent = target->collectionId;
+                    if (dropInto || copy) {
+                        // Same as "修改标签": tag X becomes target/X (merges into a same-named folder).
+                        if (target->collectionId != source->collectionId) {
+                            changed = LibraryStoreRetagCollection(LibraryGetStore(), source->collectionId,
+                                                                  target->collectionId);
+                            if (changed) {
+                                revealCollectionId = source->collectionId;
+                            }
+                        }
+                    } else {
+                        // Default: sibling reorder (before / after by drop half).
+                        i64 destParent = 0;
+                        if (target->parent && target->parent->kind == LibraryTreeKind::Collection) {
+                            destParent = target->parent->collectionId;
+                        }
+                        i64 srcParent = 0;
+                        if (source->parent && source->parent->kind == LibraryTreeKind::Collection) {
+                            srcParent = source->parent->collectionId;
+                        }
+                        if (srcParent != destParent) {
+                            changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, destParent);
+                        }                        changed = LibraryStoreReorderCollection(LibraryGetStore(), source->collectionId, destParent,
+                                                               target->collectionId, dropAfter) ||
+                                  changed;
+                    }
                 } else if (target && target->kind == LibraryTreeKind::Book) {
-                    newParent = CollectionIdForItem(target);
-                }
-                if (!target || target->kind == LibraryTreeKind::Collection || target->kind == LibraryTreeKind::Book) {
+                    i64 newParent = CollectionIdForItem(target);
                     if (newParent != source->collectionId) {
                         changed = LibraryStoreMoveCollection(LibraryGetStore(), source->collectionId, newParent);
                     }
@@ -1503,11 +1937,14 @@ static LRESULT CALLBACK LibraryTreeSubclassProc(HWND hwnd, UINT msg, WPARAM wp, 
         SetLibraryDropItem(win, 0, false);
         if (changed) {
             RefreshLibraryPanels();
+            if (revealCollectionId > 0) {
+                RevealBookInCollection(win, revealCollectionId, 0);
+            }
             return 0;
         }
         // Open only on a simple single-book click (not a multi-select gesture).
         if (!wasDragging && source && source->kind == LibraryTreeKind::Book && len(win->libraryMultiSelected) <= 1) {
-            OpenLibraryItem(win, source);
+            ScheduleOpenLibraryItem(win, source);
             return 0;
         }
         return 0;
@@ -1943,6 +2380,22 @@ static i64 EnsureWebSitesCollectionId() {
 
 // Add each URL as its own library web book (duplicates allowed) under 网页,
 // and open a dedicated browser tab for each.
+static bool IsLibraryEligibleHttpUrl(Str url) {
+    if (!url) {
+        return false;
+    }
+    // Only user-facing http(s) sites belong in the library — never extension
+    // pages, edge internals, or blank popups (extension storms used to flood 网页).
+    if (!(str::StartsWithI(url, StrL("http://")) || str::StartsWithI(url, StrL("https://")))) {
+        return false;
+    }
+    if (str::StartsWithI(url, StrL("https://chrome.google.com/webstore")) ||
+        str::StartsWithI(url, StrL("https://microsoftedge.microsoft.com/addons"))) {
+        return false;
+    }
+    return true;
+}
+
 static void AddSitesToLibraryAndTabs(MainWindow* win, Vec<Str>& urls, bool placeInWebFolder) {
     if (!win || len(urls) == 0 || !LibraryIsAvailable()) {
         return;
@@ -1951,6 +2404,11 @@ static void AddSitesToLibraryAndTabs(MainWindow* win, Vec<Str>& urls, bool place
     i64 firstBookId = 0;
     int added = 0;
     for (Str url : urls) {
+        if (!IsLibraryEligibleHttpUrl(url)) {
+            // Still open in the browser if the caller passed an internal URL.
+            WebBrowserOpenUrlAsNewTab(win, url, Str{});
+            continue;
+        }
         // Title starts empty — library shows full URL until document.title arrives.
         LibraryBook* book = LibraryStoreAddWebBook(LibraryGetStore(), url, StrL(""), UnixTimeMsNow());
         if (!book) {
@@ -1976,7 +2434,10 @@ static void AddSitesToLibraryAndTabs(MainWindow* win, Vec<Str>& urls, bool place
         WebBrowserShowPanel(win);
         SyncLibrarySelection(win);
     }
-    if (added == 0) {
+    if (added == 0 && len(urls) > 0) {
+        // All URLs were internal / non-http — browser tabs may still have opened.
+        WebBrowserShowPanel(win);
+    } else if (added == 0) {
         MessageBoxW(win->hwndFrame, CWStrTemp(_TRA("未识别到有效的网页链接。")), CWStrTemp(_TRA("添加网页")),
                     MB_OK | MB_ICONWARNING);
     }
@@ -2146,6 +2607,9 @@ void CreateLibraryPanel(MainWindow* win) {
     tree->onGetTooltip = MkFunc1Void(OnTreeTooltip);
     tree->onCustomDraw = MkFunc1Void(OnLibraryCustomDraw);
     tree->onExpansionChanged = MkFunc0(OnLibraryTreeExpansionChanged, win);
+    tree->preserveScrollOnExpand = true;
+    tree->lazyChildren = true;
+    tree->reuseRowsOnSetModel = true;
     tree->Create(treeArgs);
     LONG_PTR noDrag = GetWindowLongPtrW(tree->hwnd, GWL_STYLE);
     SetWindowLongPtrW(tree->hwnd, GWL_STYLE, noDrag | TVS_DISABLEDRAGDROP);
@@ -2172,6 +2636,12 @@ void CreateLibraryPanel(MainWindow* win) {
     LoadLibraryTreeUiState(win);
     RefreshLibraryPanel(win);
     UpdateControlsColors(win);
+}
+
+void UpdateLibraryPanelIcons(MainWindow* win) {
+    if (!win || !win->libraryAddButton) return;
+    win->libraryAddButton->pixmap = GetCachedPixmapForSvg(Str(gIconPlus), DpiScale(16), DpiScale(16));
+    if (win->hwndLibraryBox) HwndInvalidate(win->hwndLibraryBox);
 }
 
 void UpdateLibraryPanelText(MainWindow* win) {
@@ -2274,6 +2744,17 @@ TempStr LibraryDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exi
         return finish(Str(), 0);
     }
 
+    if (str::EqI(action, "open-web")) {
+        if (!a) {
+            return finish(StrL("ERROR open-web expects url"), 1);
+        }
+        logf("LibraryDbg: open-web '%s'\n", a);
+        LibraryOpenWebUrlInBrowser(win, a);
+        out.Append(StrL("OK "));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), win->uiState.webBrowserVisible ? 0 : 1);
+    }
+
     if (str::EqI(action, "switch-tab")) {
         int nTabs = win->TabCount();
         if (n1 < 0 || n1 >= nTabs) {
@@ -2360,6 +2841,226 @@ TempStr LibraryDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exi
         }
         RefreshLibraryPanels();
         return finish(fmt("OK reordered book=%d target=%d after=%d col=%lld", n1, n2, insertAfter ? 1 : 0, collectionId),
+                      0);
+    }
+
+    if (str::EqI(action, "click-burst")) {
+        // a = comma-separated book ids, "clicked" back-to-back like fast mouse clicks
+        auto* model = win->libraryTreeView ? (LibraryTreeModel*)win->libraryTreeView->treeModel : nullptr;
+        if (!a || !model) {
+            return finish(StrL("ERROR click-burst expects ids and a library tree"), 1);
+        }
+        gLibraryTimerOpens = 0;
+        StrVec ids;
+        Split(&ids, a, StrL(","), true);
+        for (Str s : ids) {
+            LibraryTreeItem* item = FindBookById(model->root, (i64)atoll(s.s));
+            if (!item) {
+                return finish(fmt("ERROR click-burst no book id=%s", s), 1);
+            }
+            ScheduleOpenLibraryItem(win, item);
+        }
+        return finish(fmt("OK clicks=%d", len(ids)), 0);
+    }
+
+    if (str::EqI(action, "click-stats")) {
+        out.Append(fmt("OK opens=%d pending=%lld active=%lld aiApplied=%lld ", gLibraryTimerOpens,
+                       win->libraryPendingOpenBookId, win->activeLibraryBookId, win->aiAppliedBookId));
+        AppendLibraryStatus(out, win);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "tag")) {
+        // n1=bookId, n2=collectionId
+        if (n1 <= 0 || n2 <= 0) {
+            return finish(StrL("ERROR tag expects bookId collectionId"), 1);
+        }
+        if (!LibraryStoreAddBookTag(LibraryGetStore(), n1, n2)) {
+            return finish(fmt("ERROR tag book=%d col=%d err=%s", n1, n2, LibraryGetError()), 1);
+        }
+        RefreshLibraryPanels();
+        return finish(fmt("OK tagged book=%d col=%d", n1, n2), 0);
+    }
+
+    if (str::EqI(action, "new-folder")) {
+        // a=name, b=parent collection id (optional, 0 = library root)
+        if (!a) {
+            return finish(StrL("ERROR new-folder expects name [parentId]"), 1);
+        }
+        i64 parentId = b && b.s && b.s[0] ? (i64)atoll(b.s) : 0;
+        LibraryCollection* created = LibraryStoreCreateCollection(LibraryGetStore(), parentId, false, a);
+        if (!created) {
+            return finish(fmt("ERROR new-folder name=%s err=%s", a, LibraryGetError()), 1);
+        }
+        i64 id = created->id;
+        DeleteLibraryCollection(created);
+        RefreshLibraryPanels();
+        return finish(fmt("OK folder=%lld parent=%lld", id, parentId), 0);
+    }
+
+    if (str::EqI(action, "retag")) {
+        // n1=source folder, n2=target folder (0 = library root)
+        if (n1 <= 0 || n2 < 0) {
+            return finish(StrL("ERROR retag expects sourceCollectionId targetCollectionId"), 1);
+        }
+        if (!LibraryStoreRetagCollection(LibraryGetStore(), n1, n2)) {
+            return finish(fmt("ERROR retag src=%d dst=%d err=%s", n1, n2, LibraryGetError()), 1);
+        }
+        RefreshLibraryPanels();
+        return finish(fmt("OK retag src=%d dst=%d", n1, n2), 0);
+    }
+
+    if (str::EqI(action, "drag-folder")) {
+        // a=source folder id, b="targetId:before|into|after"; drives the tree's real mouse handlers
+        TreeView* tv = win->libraryTreeView;
+        auto* model = tv ? (LibraryTreeModel*)tv->treeModel : nullptr;
+        char zone[16]{};
+        i64 dstId = 0;
+        if (!a || !b || !model || sscanf_s(b.s, "%lld:%15s", &dstId, zone, (unsigned)sizeof(zone)) != 2) {
+            return finish(StrL("ERROR drag-folder expects srcId 'dstId:before|into|after'"), 1);
+        }
+        if (!win->uiState.libraryVisible) {
+            SetLibraryPanelVisible(win, true);
+        }
+        LibraryTreeItem* src = FindCollectionItemRec(model->root, (i64)atoll(a.s));
+        LibraryTreeItem* dst = FindCollectionItemRec(model->root, dstId);
+        if (!src || !dst) {
+            return finish(StrL("ERROR drag-folder unknown folder"), 1);
+        }
+        Rect rs{}, rd{};
+        for (LibraryTreeItem* it : {src, dst}) {
+            HTREEITEM hi = tv->EnsureHandleByTreeItem((TreeItem)it);
+            if (hi) {
+                TreeView_EnsureVisible(tv->hwnd, hi);
+            }
+        }
+        if (!tv->GetItemRect((TreeItem)src, false, rs) || !tv->GetItemRect((TreeItem)dst, false, rd)) {
+            return finish(StrL("ERROR drag-folder rows not visible"), 1);
+        }
+        int y = rd.y + rd.dy / 2;
+        if (str::EqI(zone, "before")) {
+            y = rd.y + 1;
+        } else if (str::EqI(zone, "after")) {
+            y = rd.y + rd.dy - 2;
+        }
+        int sx = rs.x + 20, sy = rs.y + rs.dy / 2;
+        SendMessageW(tv->hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(sx, sy));
+        SendMessageW(tv->hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(sx, sy + 6));
+        SendMessageW(tv->hwnd, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(rd.x + 20, y));
+        SendMessageW(tv->hwnd, WM_LBUTTONUP, 0, MAKELPARAM(rd.x + 20, y));
+        return finish(fmt("OK dragged zone=%s", Str(zone)), 0);
+    }
+
+    if (str::EqI(action, "placements")) {
+        // one line per placement: "place book=<id> col=<collectionId, 0 = root>"
+        Vec<LibraryBook*> placed = LibraryStoreGetPlacedBooks(LibraryGetStore(), Str());
+        out.Append(fmt("OK placements=%d\n", len(placed)));
+        for (LibraryBook* book : placed) {
+            out.Append(fmt("place book=%lld col=%lld\n", book->id, book->placementId));
+        }
+        DeleteLibraryBooks(placed);
+        return finish(Str(), 0);
+    }
+
+    if (str::EqI(action, "seed")) {
+        // a="folders:perFolder:rootBooks" (control args share slots, so pack them in one string)
+        if (!gForTesting) {
+            return finish(StrL("ERROR seed requires -for-testing"), 1);
+        }
+        int rootBooks = 0;
+        n1 = n2 = 0;
+        if (!a || sscanf_s(a.s, "%d:%d:%d", &n1, &n2, &rootBooks) < 2) {
+            return finish(StrL("ERROR seed expects 'folders:perFolder[:rootBooks]'"), 1);
+        }
+        TimeStamp t0 = TimeGet();
+        if (!LibraryStoreSeedForTesting(LibraryGetStore(), n1, n2, rootBooks)) {
+            return finish(fmt("ERROR seed err=%s", LibraryGetError()), 1);
+        }
+        double seedMs = TimeSinceInMs(t0);
+        return finish(fmt("OK seeded folders=%d perFolder=%d root=%d seedMs=%.0f", n1, n2, rootBooks, seedMs), 0);
+    }
+
+    if (str::EqI(action, "perf")) {
+        // n1=pages to scroll (default 200). Reports tree build/populate/scroll/filter cost.
+        TreeView* tv = win->libraryTreeView;
+        if (!tv || !tv->hwnd) {
+            return finish(StrL("ERROR no-tree"), 1);
+        }
+        if (!win->uiState.libraryVisible) {
+            SetLibraryPanelVisible(win, true);
+        }
+        TimeStamp t0 = TimeGet();
+        LibraryTreeModel* probe = BuildModel(win, FilterTextTemp(win));
+        double buildMs = TimeSinceInMs(t0);
+        delete probe;
+
+        t0 = TimeGet();
+        RefreshLibraryPanel(win);
+        double refreshMs = TimeSinceInMs(t0);
+        out.Append(fmt("refresh[%s] ", Str(gLastLibraryRefreshTiming)));
+        int tvItems = (int)TreeView_GetCount(tv->hwnd);
+
+        t0 = TimeGet();
+        tv->ExpandAll();
+        double expandAllMs = TimeSinceInMs(t0);
+        int tvItemsExpanded = (int)TreeView_GetCount(tv->hwnd);
+
+        int pages = n1 > 0 ? n1 : 200;
+        SendMessageW(tv->hwnd, WM_VSCROLL, SB_TOP, 0);
+        UpdateWindow(tv->hwnd);
+        double scrollMaxMs = 0;
+        t0 = TimeGet();
+        for (int i = 0; i < pages; i++) {
+            TimeStamp p0 = TimeGet();
+            SendMessageW(tv->hwnd, WM_VSCROLL, SB_PAGEDOWN, 0);
+            RedrawWindow(tv->hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+            double dt = TimeSinceInMs(p0);
+            if (dt > scrollMaxMs) {
+                scrollMaxMs = dt;
+            }
+        }
+        double scrollMs = TimeSinceInMs(t0);
+
+        t0 = TimeGet();
+        SendMessageW(tv->hwnd, WM_VSCROLL, SB_BOTTOM, 0);
+        RedrawWindow(tv->hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        double jumpBottomMs = TimeSinceInMs(t0);
+
+        int scrollBefore = GetScrollPos(tv->hwnd, SB_VERT);
+        t0 = TimeGet();
+        RefreshLibraryPanel(win);
+        double refreshExpandedMs = TimeSinceInMs(t0);
+        out.Append(fmt("refreshExpanded[%s] ", Str(gLastLibraryRefreshTiming)));
+        int scrollAfter = GetScrollPos(tv->hwnd, SB_VERT);
+        out.Append(fmt("refreshExpandedMs=%.1f scrollKept=%d ", refreshExpandedMs, scrollBefore == scrollAfter ? 1 : 0));
+
+        double filterMs = -1;
+        double filterBroadMs = -1;
+        if (win->libraryFilterEdit) {
+            Edit* edit = win->libraryFilterEdit;
+            auto savedOnChanged = edit->onTextChanged;
+            edit->onTextChanged = {};
+            edit->SetText(StrL("book-0099"));
+            t0 = TimeGet();
+            RefreshLibraryPanel(win);
+            filterMs = TimeSinceInMs(t0);
+            out.Append(fmt("filter[%s] ", Str(gLastLibraryRefreshTiming)));
+            edit->SetText(StrL("book"));
+            t0 = TimeGet();
+            RefreshLibraryPanel(win);
+            filterBroadMs = TimeSinceInMs(t0);
+            out.Append(fmt("broad[%s] ", Str(gLastLibraryRefreshTiming)));
+            edit->SetText(Str());
+            edit->onTextChanged = savedOnChanged;
+            RefreshLibraryPanel(win);
+        }
+        tv->CollapseAll();
+        RefreshLibraryPanel(win);
+        return finish(fmt("OK buildMs=%.1f refreshMs=%.1f tvItems=%d expandAllMs=%.1f tvItemsExpanded=%d "
+                          "pages=%d scrollMs=%.1f scrollAvgMs=%.2f scrollMaxMs=%.1f jumpBottomMs=%.1f filterMs=%.1f "
+                          "filterBroadMs=%.1f",
+                          buildMs, refreshMs, tvItems, expandAllMs, tvItemsExpanded, pages, scrollMs,
+                          pages > 0 ? scrollMs / pages : 0.0, scrollMaxMs, jumpBottomMs, filterMs, filterBroadMs),
                       0);
     }
 

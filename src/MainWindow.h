@@ -254,6 +254,7 @@ struct MainWindow {
     Point libraryDragStart;
     bool libraryDragging = false;
     bool libraryDropAfter = false;
+    bool libraryDropInto = false; // folder dragged onto the middle of a folder row: nest into it
     // Multi-select (Ctrl/Shift) for books; TreeView still has a single "primary" selection.
     Vec<uintptr_t> libraryMultiSelected;
     uintptr_t librarySelectAnchor = 0;
@@ -345,6 +346,13 @@ struct MainWindow {
     // Last library book shown (PDF or web); drives selection + per-book bindings.
     i64 activeLibraryBookId = 0;
     int activeLibraryBookKind = 0; // LibraryBookKind as int
+    // False until the first ApplyBookAiPanelVisibility — prevents session restore
+    // from writing aiOpen=0 for lastBookId before the AI bar is restored.
+    bool libraryAiStateReady = false;
+    // book whose AI panel state was last applied; deferred re-applies skip it
+    i64 aiAppliedBookId = 0;
+    // last clicked library book, opened from a timer so rapid clicks coalesce
+    i64 libraryPendingOpenBookId = 0;
 
     // vertical splitter for resizing left side panel
     // the splitters are virtual controls living in the frame's own tree

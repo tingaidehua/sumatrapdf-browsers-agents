@@ -7,12 +7,14 @@ int GetTabbarHeight(HWND, float factor = 1.f);
 
 void SaveCurrentWindowTab(MainWindow*);
 void LoadModelIntoTab(WindowTab*);
+void SyncSidePanelsToCurrentTab(MainWindow*);
 
 void CreateTabbar(MainWindow*);
 WindowTab* AddTabToWindow(MainWindow* win, WindowTab* tab, bool deferUpdate = false);
 void TabsOnCloseWindow(MainWindow*);
 void TabsOnChangedDoc(MainWindow*);
 void TabsSelect(MainWindow* win, int tabIndex);
+void TabsSelectForce(MainWindow* win, int tabIndex);
 void ShowHomeTab(MainWindow* win);
 void TabsOnCtrlTab(MainWindow* win, bool reverse);
 void UpdateTabWidth(MainWindow*);

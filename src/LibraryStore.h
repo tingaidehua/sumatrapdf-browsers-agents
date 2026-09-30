@@ -40,6 +40,8 @@ struct LibraryBook {
     // JSON blob for NotebookLM placement, e.g.
     // {"notebook":"SumatraPDF1","notebookId":"...","notebookUrl":"...","sourceTitle":"...","updatedMs":0}
     Str notebooklm;
+    // LibraryStoreGetPlacedBooks only: collection the row is placed in, 0 = library root
+    i64 placementId = 0;
 };
 
 struct LibraryCollection {
@@ -48,6 +50,7 @@ struct LibraryCollection {
     bool isShelf = false;
     Str name;
     u32 bgColor = 0; // 0 = none, else 0x00RRGGBB
+    i64 sortPos = 0;
 };
 
 struct LibraryPathChange {
@@ -71,12 +74,28 @@ LibraryBook* LibraryStoreImportBook(LibraryStore* store, Str path, Str title, i6
 bool LibraryStoreAddReadingTime(LibraryStore* store, Str path, i64 seconds, i64 nowMs);
 Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope scope, i64 collectionId, LibrarySort sort,
                                        Str filter);
+// Every folder / root placement in one query (a book copied into N places appears N times),
+// ordered by placementId then manual order — same per-placement order as LibrarySort::Manual.
+Vec<LibraryBook*> LibraryStoreGetPlacedBooks(LibraryStore* store, Str filter);
 Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store);
+// Bulk fake rows in one transaction; -for-testing perf runs only.
+bool LibraryStoreSeedForTesting(LibraryStore* store, int nFolders, int booksPerFolder, int rootBooks);
 LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentId, bool isShelf, Str name);
 bool LibraryStoreDeleteCollection(LibraryStore* store, i64 collectionId);
 bool LibraryStoreRenameCollection(LibraryStore* store, i64 collectionId, Str name);
 bool LibraryStoreMoveCollection(LibraryStore* store, i64 collectionId, i64 newParentId);
+// Folders are multi-level tags: retagging folder "X" to "T" turns every "X/..." tag into "T/X/...",
+// i.e. X moves under dstId (0 = library root). If T already has a same-named folder the two merge
+// (books and sub-folders, recursively). srcId == dstId is a no-op; dstId inside X is rejected.
+bool LibraryStoreRetagCollection(LibraryStore* store, i64 srcId, i64 dstId);
+// Reorder a folder/shelf among siblings under parentId (0 = library root).
+bool LibraryStoreReorderCollection(LibraryStore* store, i64 collectionId, i64 parentId, i64 targetCollectionId,
+                                   bool insertAfter);
 bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collectionId);
+// Folders act as tags. A book with no tag yet moves from the library root into the folder;
+// a book that already has tags keeps them and additionally shows up in this folder.
+bool LibraryStoreAddBookTag(LibraryStore* store, i64 bookId, i64 collectionId);
+Vec<i64> LibraryStoreGetBookCollectionIds(LibraryStore* store, i64 bookId);
 // Collection id 0 denotes the visible Library root. A move removes the source
 // membership; a copy preserves it and adds the destination membership.
 bool LibraryStorePlaceBook(LibraryStore* store, i64 bookId, i64 sourceCollectionId, i64 targetCollectionId, bool copy);

@@ -87,10 +87,11 @@ async function main() {
   };
   ensureJobDirs();
 
-  const pdf =
-    arg("pdf") ||
-    "C:\\Users\\dcsco\\OneDrive\\图书馆\\从零构建大模型.pdf";
-  const bookId = arg("bookId", "37");
+  const pdf = arg("pdf");
+  if (!pdf) {
+    throw new Error("missing --pdf PATH (required)");
+  }
+  const bookId = arg("bookId", "0");
   const question = arg("q", "用一句话概括这本书的主题");
   const reuse = has("reuse");
   const skipBuild = has("skip-build") || reuse;

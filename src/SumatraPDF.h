@@ -115,6 +115,9 @@ extern HBITMAP gBitmapReloadingCue;
 extern HCURSOR gCursorDrag;
 extern bool gCrashOnOpen;
 extern HWND gLastActiveFrameHwnd;
+// Set while session tabs are restored; per-tab AI/library panel sync is skipped
+// and done once for the selected tab afterwards.
+extern bool gRestoringSessionTabs;
 
 struct DocController;
 extern DocController* gMostRecentlyOpenedDoc;

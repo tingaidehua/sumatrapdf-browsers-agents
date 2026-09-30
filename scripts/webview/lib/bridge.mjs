@@ -7,6 +7,11 @@ export function oneDriveSumatraDir() {
   return path.join(od, "SumatraPDF");
 }
 
+export function localSumatraDir() {
+  const la = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  return path.join(la, "SumatraPDF");
+}
+
 /** Prefer structured layout; fall back to legacy flat files during migration. */
 function prefer(newPath, legacyPath) {
   if (fs.existsSync(newPath)) return newPath;
@@ -14,25 +19,59 @@ function prefer(newPath, legacyPath) {
   return newPath;
 }
 
+/** Prefer machine-local heavy paths; fall back to synced OneDrive copies. */
+function preferLocal(localPath, syncPath, legacySyncPath) {
+  if (fs.existsSync(localPath)) return localPath;
+  if (syncPath && fs.existsSync(syncPath)) return syncPath;
+  if (legacySyncPath && fs.existsSync(legacySyncPath)) return legacySyncPath;
+  return localPath;
+}
+
 export function bridgePaths() {
   const root = oneDriveSumatraDir();
   const webPanel = path.join(root, "WebPanel");
+  const localWebPanel = path.join(localSumatraDir(), "WebPanel");
   const bridgeNew = path.join(webPanel, "bridge", "web-bridge.json");
   const bridgeLegacy = path.join(webPanel, "web-bridge.json");
   return {
     root,
     webPanel,
-    // Canonical structured tree under WebPanel/
+    localWebPanel,
+    // Small state stays synced (OneDrive / portable appdata).
     bridge: prefer(bridgeNew, bridgeLegacy),
     bridgeCanonical: bridgeNew,
-    jobsPending: path.join(webPanel, "jobs", "pending"),
-    jobsDone: path.join(webPanel, "jobs", "done"),
-    jobsFailed: path.join(webPanel, "jobs", "failed"),
     tabsIndex: prefer(path.join(webPanel, "tabs", "index.json"), path.join(webPanel, "tabs.json")),
     pdfTabMap: prefer(path.join(webPanel, "tabs", "pdf-map.json"), path.join(webPanel, "pdf-tabs.json")),
-    profileDir: prefer(path.join(webPanel, "profile", "WebView2"), path.join(webPanel, "WebView2")),
-    faviconsDir: prefer(path.join(webPanel, "cache", "favicons"), path.join(webPanel, "favicons")),
-    bridgeLog: prefer(path.join(webPanel, "bridge", "bridge.log"), path.join(webPanel, "bridge.log")),
+    // Heavy state: LOCALAPPDATA first, then legacy OneDrive trees.
+    jobsPending: preferLocal(
+      path.join(localWebPanel, "jobs", "pending"),
+      path.join(webPanel, "jobs", "pending")
+    ),
+    jobsDone: preferLocal(path.join(localWebPanel, "jobs", "done"), path.join(webPanel, "jobs", "done")),
+    jobsFailed: preferLocal(
+      path.join(localWebPanel, "jobs", "failed"),
+      path.join(webPanel, "jobs", "failed")
+    ),
+    profileDir: preferLocal(
+      path.join(localWebPanel, "profile", "Browser-AIChat"),
+      path.join(webPanel, "profile", "Browser-AIChat"),
+      path.join(webPanel, "profile", "WebView2")
+    ),
+    profileLibraryDir: preferLocal(
+      path.join(localWebPanel, "profile", "Browser-Library"),
+      path.join(webPanel, "profile", "Browser-Library"),
+      path.join(webPanel, "profile", "WebView2-Browser")
+    ),
+    faviconsDir: preferLocal(
+      path.join(localWebPanel, "cache", "favicons"),
+      path.join(webPanel, "cache", "favicons"),
+      path.join(webPanel, "favicons")
+    ),
+    bridgeLog: preferLocal(
+      path.join(localWebPanel, "bridge", "bridge.log"),
+      path.join(webPanel, "bridge", "bridge.log"),
+      path.join(webPanel, "bridge.log")
+    ),
   };
 }
 
@@ -51,10 +90,19 @@ export function writeJson(file, obj) {
 
 export function ensureJobDirs() {
   const p = bridgePaths();
+  // Always create canonical LOCAL job dirs so new writes leave OneDrive.
+  const localJobs = [
+    path.join(p.localWebPanel, "jobs", "pending"),
+    path.join(p.localWebPanel, "jobs", "done"),
+    path.join(p.localWebPanel, "jobs", "failed"),
+  ];
+  for (const d of localJobs) {
+    fs.mkdirSync(d, { recursive: true });
+  }
   for (const d of [p.jobsPending, p.jobsDone, p.jobsFailed]) {
     fs.mkdirSync(d, { recursive: true });
   }
-  // Keep bridge writes on the canonical path.
+  // Keep bridge writes on the synced canonical path.
   fs.mkdirSync(path.dirname(p.bridgeCanonical), { recursive: true });
   return p;
 }

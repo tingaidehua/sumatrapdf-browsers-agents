@@ -21,7 +21,7 @@
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
 
-static TempStr FindAntiGravityExecutableTemp() {
+static TempStr FindAntiGravityExecutableUncachedTemp() {
     StrVec candidates;
     TempStr userProfile = GetSpecialFolderTemp(CSIDL_PROFILE);
     if (userProfile) {
@@ -50,6 +50,22 @@ static TempStr FindAntiGravityExecutableTemp() {
         logf("FindAntiGravityExecutableTemp: not found\n");
     }
     return res;
+}
+
+static Mutex gAntiGravityFindMutex;
+static Str gAntiGravityFoundPath;
+static u64 gAntiGravityFoundAtMs = 0;
+
+// The search probes many paths plus PATH and runs on every tab switch / UI update.
+static TempStr FindAntiGravityExecutableTemp() {
+    constexpr u64 kCacheMs = 30 * 1000;
+    ScopedMutex lock(&gAntiGravityFindMutex);
+    u64 now = GetTickCount64();
+    if (gAntiGravityFoundAtMs == 0 || now - gAntiGravityFoundAtMs > kCacheMs) {
+        str::ReplaceWithCopy(&gAntiGravityFoundPath, FindAntiGravityExecutableUncachedTemp());
+        gAntiGravityFoundAtMs = now;
+    }
+    return str::DupTemp(gAntiGravityFoundPath);
 }
 
 bool IsAntiGravityInstalled() {

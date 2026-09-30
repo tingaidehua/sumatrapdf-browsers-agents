@@ -1025,6 +1025,8 @@ struct TreeView : ControlBase {
     void Clear();
 
     HTREEITEM GetHandleByTreeItem(TreeItem item);
+    // like GetHandleByTreeItem but with lazyChildren inserts the collapsed ancestors' children first
+    HTREEITEM EnsureHandleByTreeItem(TreeItem item);
     TempStr GetDefaultTooltipTemp(TreeItem ti);
     TreeItem GetItemAt(int x, int y);
     TreeItem GetTreeItemByHandle(HTREEITEM item);
@@ -1035,6 +1037,15 @@ struct TreeView : ControlBase {
     TreeItemState GetItemState(TreeItem ti);
 
     bool fullRowSelect = false;
+    // When true, expand/collapse keeps the current scroll offset (folder stays put).
+    bool preserveScrollOnExpand = false;
+    // When true, children of collapsed items are inserted on first expand (TVN_ITEMEXPANDING),
+    // so huge models only pay for rows the user can reach. Handles of such children are 0 until then.
+    bool lazyChildren = false;
+    // When true, SetTreeModel() matches rows by TreeModel::StableKey and only inserts / deletes
+    // what changed (keeps scroll position; deleting 10k rows costs seconds). The previous model
+    // must stay alive until SetTreeModel() returns.
+    bool reuseRowsOnSetModel = false;
     Size idealSize;
 
     TreeModel* treeModel = nullptr; // not owned by us
@@ -1059,6 +1070,8 @@ struct TreeView : ControlBase {
 
     // private
     TVITEMW item{};
+    // First visible item captured at TVN_ITEMEXPANDING (preserveScrollOnExpand).
+    HTREEITEM expandScrollAnchor = nullptr;
 };
 
 TreeItem GetOrSelectTreeItemAtPos(ContextMenuEvent* args, Point& pt);

@@ -1,0 +1,9 @@
+{
+  "id": "trancy",
+  "chromeId": "mjdbhokoopacimoekfgkcoogikbfgngb",
+  "name": "Trancy - AI 翻译 & 双语字幕",
+  "browser": "Browser-Library",
+  "kind": "webview2-overlay",
+  "optionsPage": "index.html",
+  "description": "Overlay: materialize from local Chrome Extensions at runtime (not git-tracked)."
+}

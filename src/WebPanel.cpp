@@ -51,6 +51,11 @@ constexpr int kLibraryCdpPort = 9225;      // Browser-Library (center Web)
 static const char* kMobileUserAgent =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
     "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1";
+// Center browser: Chrome desktop UA (no "Edg/") — Edge UA makes Gemini / AI Studio
+// pick a broken font path; Chrome spoof fixes garbled / fuzzy CJK text.
+static const char* kChromeDesktopUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/147.0.0.0 Safari/537.36";
 
 static const char* kMobileViewportScript =
     R"JS((function(){
@@ -131,10 +136,18 @@ int FindWebPanelTabByWebView(MainWindow* win, WebviewWnd* wv);
 void SyncWebPanelTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str title);
 TempStr EscapeJsonTemp(Str s);
 void EnsureBrowserExtensionsLayout();
+static void SyncAndMaterializeOverlays();
+TempStr BrowserExtensionsOverlayDirTemp();
+void ActivateWebBrowserTabByIndex(MainWindow* win, int idx, bool remember);
 
 TempStr WebPanelDataDirTemp() {
-    // Canonical tree under %OneDrive%\SumatraPDF\WebPanel\ (unified backup root).
+    // Synced / portable small state: tabs, bookmarks, bridge JSON pointer.
     return GetPathInAppDataDirTemp(StrL("WebPanel"));
+}
+
+TempStr WebPanelLocalDataDirTemp() {
+    // Machine-local heavy state: WebView2 profiles, jobs, favicon cache.
+    return GetPathInLocalSumatraDataDirTemp(StrL("WebPanel"));
 }
 
 static void MigrateWebPanelFile(Str fromRel, Str toRel) {
@@ -161,51 +174,236 @@ static void MigrateWebPanelDir(Str fromRel, Str toRel) {
     MoveFileExW(CWStrTemp(from), CWStrTemp(to), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
 }
 
+// Move a heavy subtree from synced WebPanel → local WebPanel (OneDrive offload).
+static bool DirHasAnyFile(Str dir, int depthLeft = 4) {
+    if (!dir || !dir::Exists(dir) || depthLeft < 0) {
+        return false;
+    }
+    WIN32_FIND_DATAW fd = {};
+    TempStr pat = path::JoinTemp(dir, StrL("*"));
+    HANDLE h = FindFirstFileW(CWStrTemp(pat), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    bool found = false;
+    do {
+        if (fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) {
+            continue;
+        }
+        TempStr child = path::JoinTemp(dir, ToUtf8Temp(fd.cFileName));
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            found = true;
+            break;
+        }
+        if (DirHasAnyFile(child, depthLeft - 1)) {
+            found = true;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+
+static i64 DirByteSizeApprox(Str dir, int depthLeft = 6) {
+    if (!dir || !dir::Exists(dir) || depthLeft < 0) {
+        return 0;
+    }
+    i64 total = 0;
+    WIN32_FIND_DATAW fd = {};
+    TempStr pat = path::JoinTemp(dir, StrL("*"));
+    HANDLE h = FindFirstFileW(CWStrTemp(pat), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    do {
+        if (fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) {
+            continue;
+        }
+        TempStr child = path::JoinTemp(dir, ToUtf8Temp(fd.cFileName));
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            total += DirByteSizeApprox(child, depthLeft - 1);
+        } else {
+            ULARGE_INTEGER li;
+            li.LowPart = fd.nFileSizeLow;
+            li.HighPart = fd.nFileSizeHigh;
+            total += (i64)li.QuadPart;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return total;
+}
+
+static void MigrateHeavyDirToLocal(Str rel) {
+    TempStr from = path::JoinTemp(WebPanelDataDirTemp(), rel);
+    TempStr to = path::JoinTemp(WebPanelLocalDataDirTemp(), rel);
+    if (!dir::Exists(from)) {
+        return;
+    }
+    dir::CreateAll(path::GetDirTemp(to));
+    if (!dir::Exists(to)) {
+        BOOL ok = MoveFileExW(CWStrTemp(from), CWStrTemp(to), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        logf("MigrateHeavyDirToLocal: '%s' → '%s' ok=%d\n", from, to, (int)ok);
+        return;
+    }
+    if (DirHasAnyFile(to) && !DirHasAnyFile(from)) {
+        return;
+    }
+    // Dest may be empty CreateAll stubs or a tiny fresh WebView2 profile created
+    // before migration ran — replace when synced tree is clearly larger.
+    WIN32_FIND_DATAW fd = {};
+    TempStr pat = path::JoinTemp(from, StrL("*"));
+    HANDLE h = FindFirstFileW(CWStrTemp(pat), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    int moved = 0;
+    do {
+        if (fd.cFileName[0] == L'.' &&
+            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0))) {
+            continue;
+        }
+        TempStr childFrom = path::JoinTemp(from, ToUtf8Temp(fd.cFileName));
+        TempStr childTo = path::JoinTemp(to, ToUtf8Temp(fd.cFileName));
+        i64 fromSize = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? DirByteSizeApprox(childFrom)
+                       : ((i64)fd.nFileSizeHigh << 32) | (i64)fd.nFileSizeLow;
+        i64 toSize = 0;
+        if (file::Exists(childTo) && !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            toSize = file::GetSize(childTo);
+        } else if (dir::Exists(childTo)) {
+            toSize = DirByteSizeApprox(childTo);
+        }
+        // Keep local when it already holds equal/larger data (active machine profile).
+        if (toSize > 0 && fromSize <= toSize) {
+            continue;
+        }
+        if (dir::Exists(childTo)) {
+            dir::RemoveAll(childTo);
+        } else if (file::Exists(childTo)) {
+            file::Delete(childTo);
+        }
+        BOOL ok = MoveFileExW(CWStrTemp(childFrom), CWStrTemp(childTo),
+                              MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        if (ok) {
+            moved++;
+        }
+        logf("MigrateHeavyDirToLocal child: '%s' → '%s' from=%lld toWas=%lld ok=%d\n", childFrom,
+             childTo, fromSize, toSize, (int)ok);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (moved > 0 && !DirHasAnyFile(from)) {
+        dir::RemoveAll(from);
+    } else if (DirHasAnyFile(to) && DirByteSizeApprox(from) > 0 &&
+               DirByteSizeApprox(from) <= DirByteSizeApprox(to)) {
+        // Local already holds equal/larger copy — drop leftover synced tree.
+        dir::RemoveAll(from);
+        logf("MigrateHeavyDirToLocal: removed leftover sync '%s'\n", from);
+    }
+    logf("MigrateHeavyDirToLocal: '%s' → '%s' movedChildren=%d\n", from, to, moved);
+}
+
 void EnsureWebPanelDataLayout() {
-    TempStr root = WebPanelDataDirTemp();
-    dir::CreateAll(path::JoinTemp(root, StrL("tabs")));
-    dir::CreateAll(path::JoinTemp(root, StrL("bridge")));
-    dir::CreateAll(path::JoinTemp(root, StrL("profile")));
-    dir::CreateAll(path::JoinTemp(root, StrL("cache\\favicons")));
-    dir::CreateAll(path::JoinTemp(root, StrL("jobs\\pending")));
-    dir::CreateAll(path::JoinTemp(root, StrL("jobs\\done")));
-    dir::CreateAll(path::JoinTemp(root, StrL("jobs\\failed")));
-    // Legacy flat layout → structured (idempotent).
+    TempStr syncRoot = WebPanelDataDirTemp();
+    TempStr localRoot = WebPanelLocalDataDirTemp();
+    dir::CreateAll(path::JoinTemp(syncRoot, StrL("tabs")));
+    dir::CreateAll(path::JoinTemp(syncRoot, StrL("bridge")));
+    // Called before every small state write (several per library click); the
+    // migrations and README refreshes below cost ~50 ms each time.
+    static bool layoutDone = false;
+    if (layoutDone) {
+        return;
+    }
+    layoutDone = true;
+    // Legacy flat layout → structured under sync root (idempotent).
     MigrateWebPanelFile(StrL("tabs.json"), StrL("tabs\\index.json"));
     MigrateWebPanelFile(StrL("pdf-tabs.json"), StrL("tabs\\pdf-map.json"));
     MigrateWebPanelFile(StrL("web-bridge.json"), StrL("bridge\\web-bridge.json"));
-    MigrateWebPanelFile(StrL("bridge.log"), StrL("bridge\\bridge.log"));
     MigrateWebPanelDir(StrL("favicons"), StrL("cache\\favicons"));
+    // Rename legacy profile folder names while still on sync root.
     MigrateWebPanelDir(StrL("WebView2"), StrL("profile\\Browser-AIChat"));
     MigrateWebPanelDir(StrL("profile\\WebView2"), StrL("profile\\Browser-AIChat"));
     MigrateWebPanelDir(StrL("profile\\WebView2-Browser"), StrL("profile\\Browser-Library"));
-    // Human-readable layout guide for OneDrive backup.
-    TempStr readme = path::JoinTemp(root, StrL("README.txt"));
-    if (!file::Exists(readme)) {
-        file::WriteFile(readme,
-                        StrL("SumatraPDF WebPanel data (unified under %OneDrive%\\SumatraPDF\\WebPanel)\r\n"
-                             "\r\n"
-                             "tabs\\             tab session + per-book active-tab map\r\n"
-                             "  index.json       AI panel open tabs / active tab id\r\n"
-                             "  web-index.json   Library (center) Web open tabs\r\n"
-                             "  pdf-map.json     bookId → AI + browser tab bindings\r\n"
-                             "bridge\\           CDP / Playwright bridge state\r\n"
-                             "profile\\          independent WebView2 user-data folders\r\n"
-                             "  Browser-AIChat\\  AI panel (CDP 9224)\r\n"
-                             "  Browser-Library\\ center Web (CDP 9225)\r\n"
-                             "cache\\            disposable caches\r\n"
-                             "jobs\\             automation queue\r\n"
-                             "bookmarks.txt      AI bookmark list\r\n"
-                             "\r\n"
-                             "Extensions live beside this tree:\r\n"
-                             "  %OneDrive%\\SumatraPDF\\extensions\\installed\\<id>\\plugin.json\r\n"
-                             "  %OneDrive%\\SumatraPDF\\extensions\\installed\\<id>\\manifest.json\r\n"
-                             "  GitHub: https://github.com/tingaidehua/sumatrapdf-browsers-agents\r\n"));
+    // Offload heavy trees BEFORE creating empty local stubs (stubs would block MoveFile).
+    MigrateHeavyDirToLocal(StrL("profile"));
+    MigrateHeavyDirToLocal(StrL("cache"));
+    MigrateHeavyDirToLocal(StrL("jobs"));
+    // Ensure canonical dirs exist after migration.
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("profile\\Browser-AIChat")));
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("profile\\Browser-Library")));
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("cache\\favicons")));
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("jobs\\pending")));
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("jobs\\done")));
+    dir::CreateAll(path::JoinTemp(localRoot, StrL("jobs\\failed")));
+    MigrateWebPanelFile(StrL("bridge.log"), StrL("bridge\\bridge.log"));
+    // Prefer local bridge.log; move if still under sync.
+    {
+        TempStr syncLog = path::JoinTemp(syncRoot, StrL("bridge\\bridge.log"));
+        TempStr localLog = path::JoinTemp(localRoot, StrL("bridge\\bridge.log"));
+        if (file::Exists(syncLog) && !file::Exists(localLog)) {
+            dir::CreateAll(path::GetDirTemp(localLog));
+            MoveFileExW(CWStrTemp(syncLog), CWStrTemp(localLog), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH);
+        }
     }
+    // Human-readable layout guide (always refresh).
+    file::WriteFile(
+        path::JoinTemp(syncRoot, StrL("README.txt")),
+        StrL("SumatraPDF WebPanel — SYNCED small state (OneDrive / portable)\r\n"
+             "\r\n"
+             "tabs\\             tab session + per-book active-tab map\r\n"
+             "  index.json       AI panel open tabs / active tab id\r\n"
+             "  web-index.json   Library (center) Web open tabs\r\n"
+             "  pdf-map.json     bookId → AI + browser tab bindings + aiOpen\r\n"
+             "bridge\\           web-bridge.json (CDP ports; tiny)\r\n"
+             "bookmarks.txt      AI bookmark list\r\n"
+             "\r\n"
+             "HEAVY state lives under %%LOCALAPPDATA%%\\SumatraPDF\\WebPanel\\\r\n"
+             "  (profiles / cache / jobs) — not synced, re-login once per machine.\r\n"
+             "\r\n"
+             "Extensions: %%AppData-or-OneDrive%%\\SumatraPDF\\extensions\\\r\n"
+             "Scripts:    …\\SumatraPDF\\scripts\\webview\\  (or junction to repo)\r\n"
+             "GitHub: https://github.com/tingaidehua/sumatrapdf-browsers-agents\r\n"));
+    file::WriteFile(
+        path::JoinTemp(localRoot, StrL("README.txt")),
+        StrL("SumatraPDF WebPanel — LOCAL heavy state (%%LOCALAPPDATA%%\\SumatraPDF\\WebPanel)\r\n"
+             "\r\n"
+             "profile\\Browser-AIChat\\   AI WebView2 user data (CDP 9224)\r\n"
+             "profile\\Browser-Library\\  center Web user data (CDP 9225)\r\n"
+             "cache\\favicons\\\r\n"
+             "jobs\\pending|done|failed\\\r\n"
+             "bridge\\bridge.log\r\n"
+             "\r\n"
+             "Do not move this folder into OneDrive.\r\n"));
     EnsureBrowserExtensionsLayout();
+    EnsureScriptsWebviewLayout();
+}
+
+static TempStr PreferLocalOrSyncRelTemp(Str rel, Str legacyRel, bool acceptEmptyLocal) {
+    TempStr local = path::JoinTemp(WebPanelLocalDataDirTemp(), rel);
+    if (file::Exists(local)) {
+        return local;
+    }
+    if (dir::Exists(local) && (acceptEmptyLocal || DirHasAnyFile(local))) {
+        return local;
+    }
+    TempStr sync = path::JoinTemp(WebPanelDataDirTemp(), rel);
+    if (file::Exists(sync) || (dir::Exists(sync) && DirHasAnyFile(sync))) {
+        return sync;
+    }
+    if (dir::Exists(sync) && acceptEmptyLocal) {
+        return sync;
+    }
+    if (legacyRel) {
+        TempStr leg = path::JoinTemp(WebPanelDataDirTemp(), legacyRel);
+        if (file::Exists(leg) || (dir::Exists(leg) && DirHasAnyFile(leg))) {
+            return leg;
+        }
+    }
+    return local;
 }
 
 static TempStr PreferNewOrLegacyTemp(Str newRel, Str legacyRel) {
+    // Sync-root prefer helper (tabs / bridge JSON stay synced).
     TempStr root = WebPanelDataDirTemp();
     TempStr neu = path::JoinTemp(root, newRel);
     if (file::Exists(neu) || dir::Exists(neu)) {
@@ -247,31 +445,26 @@ TempStr BridgePathTemp() {
 }
 
 TempStr WebViewProfileDirTemp() {
-    // AI panel — Browser-AIChat (CDP 9224 / NotebookLM automation).
-    TempStr root = WebPanelDataDirTemp();
-    TempStr neu = path::JoinTemp(root, StrL("profile\\Browser-AIChat"));
-    if (dir::Exists(neu)) {
-        return neu;
-    }
-    return PreferNewOrLegacyTemp(StrL("profile\\Browser-AIChat"), StrL("profile\\WebView2"));
+    // AI panel — Browser-AIChat (CDP 9224). Prefer LOCAL; fall back to synced legacy.
+    return PreferLocalOrSyncRelTemp(StrL("profile\\Browser-AIChat"), StrL("profile\\WebView2"), false);
 }
 
 TempStr WebViewBrowserProfileDirTemp() {
     // Center Library Web — Browser-Library (CDP 9225).
-    TempStr root = WebPanelDataDirTemp();
-    TempStr neu = path::JoinTemp(root, StrL("profile\\Browser-Library"));
-    if (dir::Exists(neu)) {
-        return neu;
-    }
-    return PreferNewOrLegacyTemp(StrL("profile\\Browser-Library"), StrL("profile\\WebView2-Browser"));
+    return PreferLocalOrSyncRelTemp(StrL("profile\\Browser-Library"), StrL("profile\\WebView2-Browser"), false);
 }
 
 TempStr BrowserExtensionsRootDirTemp() {
-    return path::JoinTemp(GetOneDriveAppDataDirTemp(), StrL("extensions"));
+    return path::JoinTemp(GetAppDataDirTemp(), StrL("extensions"));
 }
 
 TempStr BrowserExtensionsInstalledDirTemp() {
     return path::JoinTemp(BrowserExtensionsRootDirTemp(), StrL("installed"));
+}
+
+TempStr BrowserExtensionsOverlayDirTemp() {
+    // Chrome payloads — machine-local, never git / never OneDrive.
+    return GetPathInLocalSumatraDataDirTemp(StrL("extensions\\overlay"));
 }
 
 void EnsureBrowserExtensionsLayout() {
@@ -285,18 +478,17 @@ void EnsureBrowserExtensionsLayout() {
         StrL("SumatraPDF browsers / agents — extensions\r\n"
              "\r\n"
              "installed\\<id>\\plugin.json   host plugin (native / Playwright action)\r\n"
-             "installed\\<id>\\manifest.json unpacked Chromium extension (WebView2 AddBrowserExtension)\r\n"
+             "overlays\\<id>.json           overlay descriptor (tiny; tracked in git)\r\n"
+             "\r\n"
+             "Chrome payloads (NOT in git, NOT on OneDrive):\r\n"
+             "  %%LOCALAPPDATA%%\\SumatraPDF\\extensions\\overlay\\<id>\\\r\n"
+             "  Copied from Chrome Extensions\\<chromeId> on launch (strip _metadata).\r\n"
              "\r\n"
              "plugin.json \"browser\": Browser-AIChat | Browser-Library\r\n"
-             "  (host plugins only appear on that profile's puzzle menu)\r\n"
              "\r\n"
              "Built-in host plugins (Browser-AIChat only):\r\n"
-             "  notebooklm-add         添加到 NotebookLM (center PDF/网页)\r\n"
-             "  notebooklm-focus-pdf   仅与当前 PDF/网页 对话\r\n"
-             "\r\n"
-             "Drop Chrome-unpacked extensions under installed\\ for WebView2 profiles\r\n"
-             "Browser-AIChat (CDP 9224) and Browser-Library (CDP 9225).\r\n"
-             "\r\n"
+             "  notebooklm-add / notebooklm-focus-pdf\r\n"
+             "Overlay: Trancy (Browser-Library) — right-click 沉浸式翻译 + options\r\n"
              "GitHub: https://github.com/tingaidehua/sumatrapdf-browsers-agents\r\n"));
 
     // Seed / refresh built-in host plugins (plugin.json only — not Chrome CRX).
@@ -324,22 +516,24 @@ void EnsureBrowserExtensionsLayout() {
     seedHost(StrL("notebooklm-focus-pdf"), StrL("仅与当前 PDF 对话"), StrL("notebooklm.focus"),
              StrL("按图书馆 NotebookLM 记录，仅选中中间栏当前 PDF/网页来源并打开对话"),
              StrL("Browser-AIChat"));
+
+    SyncAndMaterializeOverlays();
 }
 
 TempStr FaviconsDirTemp() {
-    return PreferNewOrLegacyTemp(StrL("cache\\favicons"), StrL("favicons"));
+    return PreferLocalOrSyncRelTemp(StrL("cache\\favicons"), StrL("favicons"), true);
 }
 
 TempStr WebPanelJobsPendingTemp() {
-    return path::JoinTemp(WebPanelDataDirTemp(), StrL("jobs\\pending"));
+    return PreferLocalOrSyncRelTemp(StrL("jobs\\pending"), {}, true);
 }
 
 TempStr WebPanelJobsDoneTemp() {
-    return path::JoinTemp(WebPanelDataDirTemp(), StrL("jobs\\done"));
+    return PreferLocalOrSyncRelTemp(StrL("jobs\\done"), {}, true);
 }
 
 TempStr WebPanelJobsFailedTemp() {
-    return path::JoinTemp(WebPanelDataDirTemp(), StrL("jobs\\failed"));
+    return PreferLocalOrSyncRelTemp(StrL("jobs\\failed"), {}, true);
 }
 
 // host for https://a.b/c → a.b
@@ -1187,6 +1381,8 @@ static void ApplyBookAiPanelVisibility(MainWindow* win, i64 bookId, LibraryBookK
             wv->SetControllerVisible(false, false);
         }
     }
+    win->libraryAiStateReady = true;
+    win->aiAppliedBookId = bookId;
 }
 
 // One-shot: older builds stored the center browser tab in webTab* for Web books.
@@ -1648,10 +1844,15 @@ void NavigateWebPanel(MainWindow* win, Str url) {
 }
 
 void OnWebPanelRefresh(MainWindow* win) {
-    if (!win || !win->webPanelWebView) {
+    if (!win) {
         return;
     }
-    win->webPanelWebView->Reload();
+    // Point at the visible AI tab before reload (multi-tab can leave a stale ptr).
+    ShowActiveWebPanelTab(win);
+    if (!win->webPanelWebView) {
+        return;
+    }
+    win->webPanelWebView->Reload(true);
 }
 
 void OnFocusCurrentPdfNotebookLm(MainWindow* win) {
@@ -2094,6 +2295,9 @@ struct TabsPopupState {
     int closeAllY0 = 0;
     int tabsY0 = 0;
     bool hasCloseAll = false;
+    // closing a tab can hand focus to a WebView a moment later; don't let that dismiss the
+    // reopened popup (middle-click closes several tabs in a row)
+    ULONGLONG keepOpenUntilMs = 0;
     Str stats;
     Str emptyHint;
     Str closeAllLabel;
@@ -2140,6 +2344,9 @@ static int TabsPopupHitRow(TabsPopupState* st, int y) {
     return idx;
 }
 
+static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs);
+constexpr UINT kTabsPopupReactivateMsg = WM_APP + 0x51;
+
 static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     TabsPopupState* st = gTabsPopup;
     if (!st || st->hwnd != hwnd) {
@@ -2148,8 +2355,15 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     switch (msg) {
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {
+                if (GetTickCount64() < st->keepOpenUntilMs) {
+                    PostMessageW(hwnd, kTabsPopupReactivateMsg, 0, 0);
+                    return 0;
+                }
                 DestroyTabsPopup();
             }
+            return 0;
+        case kTabsPopupReactivateMsg:
+            SetForegroundWindow(hwnd);
             return 0;
         case WM_MOUSEMOVE: {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -2180,9 +2394,15 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             int hit = TabsPopupHitRow(st, pt.y);
             if (hit >= 0) {
+                // stay open at the same spot: the next tab slides under the cursor
                 MainWindow* win = st->win;
+                RECT wr{};
+                GetWindowRect(hwnd, &wr);
                 DestroyTabsPopup();
                 CloseWebPanelTabAt(win, hit);
+                if (IsMainWindowValid(win)) {
+                    ShowTabsMenuAt(win, POINT{wr.left, wr.top}, 600);
+                }
             }
             return 0;
         }
@@ -2276,6 +2496,12 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 }
 
 void ShowTabsMenu(MainWindow* win) {
+    POINT pt;
+    GetCursorPos(&pt);
+    ShowTabsMenuAt(win, pt, 0);
+}
+
+static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs) {
     if (!win || !win->hwndWebPanelBox) {
         return;
     }
@@ -2357,16 +2583,24 @@ void ShowTabsMenu(MainWindow* win) {
     }
     width = std::min(width, DpiScale(560));
 
-    POINT pt;
-    GetCursorPos(&pt);
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"SUMATRA_WEBPANEL_TABS_MENU", L"",
-                                WS_POPUP | WS_BORDER, pt.x, pt.y, width, height, win->hwndFrame, nullptr,
+                                WS_POPUP | WS_BORDER, pos.x, pos.y, width, height, win->hwndFrame, nullptr,
                                 GetModuleHandleW(nullptr), nullptr);
     if (!hwnd) {
+        for (Str& t : st->titles) {
+            str::Free(t);
+        }
+        str::Free(st->stats);
+        str::Free(st->emptyHint);
+        str::Free(st->closeAllLabel);
         delete st;
         return;
     }
     st->hwnd = hwnd;
+    st->keepOpenUntilMs = keepOpenMs ? GetTickCount64() + keepOpenMs : 0;
+    POINT cur;
+    GetCursorPos(&cur);
+    st->hover = TabsPopupHitRow(st, cur.y - pos.y);
     gTabsPopup = st;
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
@@ -2394,10 +2628,12 @@ void OnFocusCurrentPdfNotebookLm(MainWindow* win);
 struct BrowserPluginEntry {
     Str id;
     Str name;
-    Str kind;    // "host" | "webview2"
-    Str browser; // "Browser-AIChat" | "Browser-Library" | empty (= all)
-    Str action;  // host action id
+    Str kind;         // "host" | "webview2" | "webview2-overlay"
+    Str browser;      // "Browser-AIChat" | "Browser-Library" | empty (= all)
+    Str action;       // host action id
     Str folder;
+    Str chromeId;     // store id for chrome-extension:// options
+    Str optionsPage;  // e.g. index.html
 };
 
 static void FreeBrowserPluginEntry(BrowserPluginEntry* e) {
@@ -2410,6 +2646,8 @@ static void FreeBrowserPluginEntry(BrowserPluginEntry* e) {
     str::Free(e->browser);
     str::Free(e->action);
     str::Free(e->folder);
+    str::Free(e->chromeId);
+    str::Free(e->optionsPage);
     *e = {};
 }
 
@@ -2437,13 +2675,195 @@ static TempStr ReadPluginJsonFieldTemp(Str json, Str field) {
     return res;
 }
 
-static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFilter) {
-    if (!out) {
+static TempStr FindRepoExtensionsOverlaysTemp() {
+    TempStr dir = GetSelfExeDirTemp();
+    for (int i = 0; i < 8 && dir; i++) {
+        TempStr candidate = path::JoinTemp(dir, StrL("extensions\\overlays"));
+        if (dir::Exists(candidate)) {
+            return candidate;
+        }
+        TempStr parent = path::GetDirTemp(dir);
+        if (!parent || str::EqI(parent, dir)) {
+            break;
+        }
+        dir = parent;
+    }
+    return {};
+}
+
+static bool ShCopyDirContents(Str dstDir, Str srcDir) {
+    if (!dir::Exists(srcDir)) {
+        return false;
+    }
+    dir::CreateAll(dstDir);
+    TempStr fromPath = path::JoinTemp(srcDir, StrL("*"));
+    TempWStr fromW = ToWStrTemp(fromPath);
+    TempWStr toW = ToWStrTemp(dstDir);
+    int nFrom = len(fromW) + 2;
+    int nTo = len(toW) + 2;
+    TempWStr fromZ = WStr(AllocArrayTemp<WCHAR>(nFrom), nFrom);
+    TempWStr toZ = WStr(AllocArrayTemp<WCHAR>(nTo), nTo);
+    wstr::BufSet(fromZ, fromW);
+    wstr::BufSet(toZ, toW);
+    SHFILEOPSTRUCTW shfo = {nullptr, FO_COPY, fromZ.s, toZ.s, FOF_NO_UI | FOF_NOCONFIRMMKDIR, FALSE, nullptr,
+                            nullptr};
+    int res = SHFileOperationW(&shfo);
+    return res == 0 && !shfo.fAnyOperationsAborted;
+}
+
+static TempStr FindChromeUnpackedExtensionTemp(Str chromeId) {
+    if (!chromeId) {
+        return {};
+    }
+    TempStr local = GetEnvVariableTemp(StrL("LOCALAPPDATA"));
+    if (!local) {
+        return {};
+    }
+    TempStr best = {};
+    TempStr bestVer = {};
+    TempStr roots[] = {
+        path::JoinTemp(local, StrL("Google\\Chrome\\User Data")),
+        path::JoinTemp(local, StrL("Microsoft\\Edge\\User Data")),
+    };
+    for (TempStr root : roots) {
+        if (!dir::Exists(root)) {
+            continue;
+        }
+        DirIter profiles{root};
+        profiles.includeDirs = true;
+        profiles.includeFiles = false;
+        for (DirIterEntry* pe : profiles) {
+            if (!pe || !pe->isDir || !pe->name) {
+                continue;
+            }
+            if (str::EqI(pe->name, StrL("System Profile")) || str::StartsWithI(pe->name, StrL("Guest"))) {
+                continue;
+            }
+            TempStr extRoot = path::JoinTemp(pe->filePath, fmt("Extensions\\%s", chromeId));
+            if (!dir::Exists(extRoot)) {
+                continue;
+            }
+            DirIter vers{extRoot};
+            vers.includeDirs = true;
+            vers.includeFiles = false;
+            for (DirIterEntry* ve : vers) {
+                if (!ve || !ve->isDir || !ve->name) {
+                    continue;
+                }
+                if (!file::Exists(path::JoinTemp(ve->filePath, StrL("manifest.json")))) {
+                    continue;
+                }
+                if (!bestVer || str::CmpNatural(ve->name, bestVer) > 0) {
+                    bestVer = str::DupTemp(ve->name);
+                    best = str::DupTemp(ve->filePath);
+                }
+            }
+        }
+    }
+    return best;
+}
+
+static void MaterializeChromeOverlay(Str overlayId, Str chromeId, Str name, Str browser, Str optionsPage,
+                                     Str description) {
+    if (!overlayId || !chromeId) {
         return;
     }
-    EnsureBrowserExtensionsLayout();
-    TempStr installed = BrowserExtensionsInstalledDirTemp();
-    DirIter di{installed};
+    TempStr src = FindChromeUnpackedExtensionTemp(chromeId);
+    if (!src) {
+        logf("MaterializeChromeOverlay: Chrome extension '%s' not found (install in Chrome first)\n", chromeId);
+        return;
+    }
+    TempStr dst = path::JoinTemp(BrowserExtensionsOverlayDirTemp(), overlayId);
+    TempStr stampPath = path::JoinTemp(dst, StrL(".sumatra-overlay-src"));
+    TempStr stampWant = fmt("%s\n%s\n", chromeId, src);
+    if (dir::Exists(dst) && file::Exists(path::JoinTemp(dst, StrL("manifest.json"))) && file::Exists(stampPath)) {
+        Str prev = file::ReadFile(stampPath);
+        bool same = prev && str::Eq(prev, stampWant);
+        str::Free(prev);
+        if (same) {
+            return;
+        }
+    }
+    if (dir::Exists(dst)) {
+        dir::RemoveAll(dst);
+    }
+    dir::CreateAll(dst);
+    if (!ShCopyDirContents(dst, src)) {
+        logf("MaterializeChromeOverlay: copy failed '%s' → '%s'\n", src, dst);
+        return;
+    }
+    TempStr meta = path::JoinTemp(dst, StrL("_metadata"));
+    if (dir::Exists(meta)) {
+        dir::RemoveAll(meta);
+    }
+    TempStr side = path::JoinTemp(dst, StrL("plugin.json"));
+    TempStr body =
+        fmt("{\n"
+            "  \"id\": %s,\n"
+            "  \"chromeId\": %s,\n"
+            "  \"name\": %s,\n"
+            "  \"kind\": \"webview2-overlay\",\n"
+            "  \"browser\": %s,\n"
+            "  \"optionsPage\": %s,\n"
+            "  \"description\": %s\n"
+            "}\n",
+            EscapeJsonTemp(overlayId), EscapeJsonTemp(chromeId), EscapeJsonTemp(name ? name : overlayId),
+            EscapeJsonTemp(browser ? browser : StrL("Browser-Library")),
+            EscapeJsonTemp(optionsPage ? optionsPage : StrL("index.html")),
+            EscapeJsonTemp(description ? description : StrL("")));
+    file::WriteFile(side, body);
+    file::WriteFile(stampPath, stampWant);
+    logf("MaterializeChromeOverlay: '%s' ready at '%s'\n", overlayId, dst);
+}
+
+static void SyncAndMaterializeOverlays() {
+    TempStr appOverlays = path::JoinTemp(BrowserExtensionsRootDirTemp(), StrL("overlays"));
+    dir::CreateAll(appOverlays);
+    dir::CreateAll(BrowserExtensionsOverlayDirTemp());
+
+    TempStr repoOverlays = FindRepoExtensionsOverlaysTemp();
+    if (repoOverlays) {
+        DirIter di{repoOverlays};
+        di.includeFiles = true;
+        di.includeDirs = false;
+        for (DirIterEntry* de : di) {
+            if (!de || !de->name || !str::EndsWithI(de->name, StrL(".json"))) {
+                continue;
+            }
+            file::Copy(path::JoinTemp(appOverlays, de->name), de->filePath, false);
+        }
+    }
+
+    DirIter di{appOverlays};
+    di.includeFiles = true;
+    di.includeDirs = false;
+    for (DirIterEntry* de : di) {
+        if (!de || !de->name || !str::EndsWithI(de->name, StrL(".json"))) {
+            continue;
+        }
+        Str raw = file::ReadFile(de->filePath);
+        TempStr id = ReadPluginJsonFieldTemp(raw, StrL("id"));
+        TempStr chromeId = ReadPluginJsonFieldTemp(raw, StrL("chromeId"));
+        TempStr name = ReadPluginJsonFieldTemp(raw, StrL("name"));
+        TempStr browser = ReadPluginJsonFieldTemp(raw, StrL("browser"));
+        TempStr optionsPage = ReadPluginJsonFieldTemp(raw, StrL("optionsPage"));
+        TempStr description = ReadPluginJsonFieldTemp(raw, StrL("description"));
+        str::Free(raw);
+        if (!id) {
+            id = path::GetPathNoExtTemp(de->name);
+        }
+        if (!chromeId) {
+            continue;
+        }
+        MaterializeChromeOverlay(id, chromeId, name, browser, optionsPage, description);
+    }
+}
+
+static void CollectInstalledPluginsFromDir(Vec<BrowserPluginEntry>* out, Str browserFilter, Str root) {
+    if (!out || !root || !dir::Exists(root)) {
+        return;
+    }
+    DirIter di{root};
     di.includeDirs = true;
     di.includeFiles = false;
     for (DirIterEntry* de : di) {
@@ -2462,6 +2882,8 @@ static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFil
             TempStr action = ReadPluginJsonFieldTemp(raw, StrL("action"));
             TempStr id = ReadPluginJsonFieldTemp(raw, StrL("id"));
             TempStr browser = ReadPluginJsonFieldTemp(raw, StrL("browser"));
+            TempStr chromeId = ReadPluginJsonFieldTemp(raw, StrL("chromeId"));
+            TempStr optionsPage = ReadPluginJsonFieldTemp(raw, StrL("optionsPage"));
             str::Free(raw);
             if (id) {
                 str::ReplaceWithCopy(&e.id, id);
@@ -2470,9 +2892,18 @@ static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFil
             e.kind = str::Dup(kind ? kind : StrL("host"));
             e.browser = str::Dup(browser);
             e.action = str::Dup(action);
-            // Host plugins: require matching browser (default Browser-AIChat if omitted).
-            TempStr want = e.browser ? e.browser : StrL("Browser-AIChat");
+            e.chromeId = str::Dup(chromeId);
+            e.optionsPage = str::Dup(optionsPage);
+            bool isOverlay = e.kind && (str::Eq(e.kind, StrL("webview2-overlay")) ||
+                                        str::Eq(e.kind, StrL("webview2")));
+            // Host plugins default to AI; overlays default to Library.
+            TempStr want = e.browser ? e.browser : (isOverlay ? StrL("Browser-Library") : StrL("Browser-AIChat"));
             if (browserFilter && !str::EqI(want, browserFilter)) {
+                FreeBrowserPluginEntry(&e);
+                continue;
+            }
+            // Overlay without materialized manifest is not usable yet.
+            if (isOverlay && !file::Exists(manifestPath)) {
                 FreeBrowserPluginEntry(&e);
                 continue;
             }
@@ -2480,14 +2911,31 @@ static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFil
             continue;
         }
         if (file::Exists(manifestPath)) {
-            // Unpacked Chromium extensions are available to both profiles for now.
             e.name = str::Dup(de->name);
             e.kind = str::Dup(StrL("webview2"));
+            if (browserFilter && !str::EqI(browserFilter, StrL("Browser-Library")) &&
+                !str::EqI(browserFilter, StrL("Browser-AIChat"))) {
+                // keep
+            }
+            // Plain manifest folders: show on Library by default.
+            if (browserFilter && !str::EqI(browserFilter, StrL("Browser-Library"))) {
+                FreeBrowserPluginEntry(&e);
+                continue;
+            }
             out->Append(e);
             continue;
         }
         FreeBrowserPluginEntry(&e);
     }
+}
+
+static void CollectInstalledPlugins(Vec<BrowserPluginEntry>* out, Str browserFilter) {
+    if (!out) {
+        return;
+    }
+    EnsureBrowserExtensionsLayout();
+    CollectInstalledPluginsFromDir(out, browserFilter, BrowserExtensionsInstalledDirTemp());
+    CollectInstalledPluginsFromDir(out, browserFilter, BrowserExtensionsOverlayDirTemp());
 }
 
 // Resolve middle-pane target for NotebookLM host plugins: center Web XOR PDF.
@@ -2593,7 +3041,8 @@ void ShowBrowserExtensionsMenu(MainWindow* win, Str browserProfile) {
     constexpr UINT kManageId = 9000;
     for (int i = 0; i < len(plugins); i++) {
         TempStr label = plugins[i].name ? plugins[i].name : plugins[i].id;
-        if (plugins[i].kind && str::Eq(plugins[i].kind, StrL("webview2"))) {
+        if (plugins[i].kind && (str::Eq(plugins[i].kind, StrL("webview2")) ||
+                                str::Eq(plugins[i].kind, StrL("webview2-overlay")))) {
             label = fmt("🧩 %s", label);
         }
         AppendMenuW(menu, MF_STRING, (UINT)(i + 1), CWStrTemp(label));
@@ -2616,6 +3065,12 @@ void ShowBrowserExtensionsMenu(MainWindow* win, Str browserProfile) {
         BrowserPluginEntry& e = plugins[cmd - 1];
         if (e.kind && str::Eq(e.kind, StrL("host")) && e.action) {
             RunHostPluginAction(win, e.action);
+        } else if (e.kind && (str::Eq(e.kind, StrL("webview2-overlay")) || str::Eq(e.kind, StrL("webview2"))) &&
+                   e.chromeId) {
+            // Open extension options inside center browser — do NOT add to library.
+            TempStr page = e.optionsPage ? e.optionsPage : StrL("index.html");
+            TempStr url = fmt("chrome-extension://%s/%s", e.chromeId, page);
+            WebBrowserOpenUrlAsNewTab(win, url, e.name ? e.name : StrL("Trancy"));
         } else if (e.folder) {
             SumatraOpenPathInDefaultFileManager(e.folder);
         }
@@ -2684,14 +3139,26 @@ bool OnWebNavStarting(void* ctx, Str url, bool newWindow) {
     return true;
 }
 
-// Center Web: never route into AI. New windows become library web books.
+// Center Web: never route into AI. Extension/site popups become browser tabs only —
+// never auto-add to the library (Trancy etc. spam login/marketing windows otherwise).
 bool OnWebBrowserNavStarting(void* ctx, Str url, bool newWindow) {
     auto* win = (MainWindow*)ctx;
     if (!IsMainWindowValid(win)) {
         return true;
     }
     if (newWindow && url) {
-        LibraryOpenWebUrlInBrowser(win, url);
+        if (str::EqI(url, StrL("about:blank")) || str::StartsWithI(url, StrL("about:blank?"))) {
+            return false;
+        }
+        // Reuse an existing tab with the same URL to avoid popup storms.
+        for (int i = 0; i < len(win->webBrowserTabs); i++) {
+            if (win->webBrowserTabs[i].url && str::EqI(win->webBrowserTabs[i].url, url)) {
+                ActivateWebBrowserTabByIndex(win, i, true);
+                WebBrowserShowPanel(win);
+                return false;
+            }
+        }
+        WebBrowserOpenUrlAsNewTab(win, url, {});
         return false;
     }
     return true;
@@ -2977,8 +3444,40 @@ void RelayoutWebPanel(MainWindow* win) {
     RedrawWindow(win->hwndWebPanelBox, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
+void WebPanelPersistActiveBookAiState(MainWindow* win) {
+    if (!win || win->activeLibraryBookId <= 0) {
+        return;
+    }
+    if (win->uiState.webPanelVisible) {
+        RememberPdfActiveTab(win);
+    }
+    SetBookAiPanelOpen(win->activeLibraryBookId, win->uiState.webPanelVisible);
+    LibrarySaveUiState(win);
+}
+
 void DeferredApplyLastBookAi(MainWindow* win) {
-    if (!IsMainWindowValid(win) || win->activeLibraryBookId <= 0) {
+    if (!IsMainWindowValid(win)) {
+        return;
+    }
+    // Session may finish loading the PDF after CreateWebPanel; resolve book from
+    // the current tab path when lastBookId was not restored yet.
+    if (win->activeLibraryBookId <= 0 && LibraryIsAvailable()) {
+        WindowTab* tab = win->CurrentTab();
+        if (tab && tab->filePath) {
+            LibraryBook* book = LibraryStoreFindBookByPath(LibraryGetStore(), tab->filePath);
+            if (book) {
+                win->activeLibraryBookId = book->id;
+                win->activeLibraryBookKind = (int)book->kind;
+                DeleteLibraryBook(book);
+            }
+        }
+    }
+    if (win->activeLibraryBookId <= 0) {
+        return;
+    }
+    if (win->libraryAiStateReady && win->aiAppliedBookId == win->activeLibraryBookId) {
+        // already applied by LibraryOnActiveBookChanged; restoring bindings again
+        // re-activates the same WebView tabs (~100 ms each)
         return;
     }
     LibraryBookKind kind = (LibraryBookKind)win->activeLibraryBookKind;
@@ -2995,11 +3494,35 @@ void DeferredApplyLastBookAi(MainWindow* win) {
     ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);
 }
 
+constexpr UINT_PTR kApplyBookAiTimerId = 0x41494150;
+
+static void CALLBACK OnApplyBookAiTimer(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+    KillTimer(hwnd, id);
+    MainWindow* win = FindMainWindowByHwnd(hwnd);
+    if (win && win->hwndFrame == hwnd) {
+        DeferredApplyLastBookAi(win);
+    }
+}
+
+// Restoring a book's AI tabs activates WebViews (100-300 ms). WM_TIMER is only
+// delivered when no input is pending, so fast library/tab switching applies it
+// once, for the book the user stops on.
+void ScheduleApplyBookAi(MainWindow* win) {
+    if (!win || !win->hwndFrame) {
+        return;
+    }
+    // re-arming resets the delay: applies once the user stays on a book
+    constexpr UINT kSettleMs = 250;
+    SetTimer(win->hwndFrame, kApplyBookAiTimerId, kSettleMs, OnApplyBookAiTimer);
+}
+
 void CreateWebPanel(MainWindow* win) {
     if (!HasWebView()) {
         return;
     }
     EnsureWebPanelDataLayout();
+    EnsureBrowserExtensionsLayout();
+    EnsureScriptsWebviewLayout();
     UpdateWebPanelCpuSample();
     LoadBookmarks();
 
@@ -3072,6 +3595,7 @@ void CreateWebPanel(MainWindow* win) {
     // Per-book AI open/closed is restored after layout (lastBookId / session doc).
     win->uiState.webPanelVisible = false;
     win->uiState.aiChatVisible = false;
+    win->aiAppliedBookId = 0;
     uitask::Post(MkFunc0(DeferredApplyLastBookAi, win), "ApplyLastBookAi");
 }
 
@@ -3202,16 +3726,100 @@ void WebPanelOnDocumentChanged(MainWindow* win) {
     RestorePdfActiveTab(win);
 }
 
-TempStr ScriptsWebviewDirTemp() {
-    TempStr od = path::JoinTemp(GetOneDriveAppDataDirTemp(), StrL("scripts\\webview"));
-    if (file::Exists(path::JoinTemp(od, StrL("package.json")))) {
-        return od;
+TempStr FindRepoScriptsWebviewTemp() {
+    // SUMATRA_SCRIPTS overrides everything (folder that contains package.json).
+    TempStr env = GetEnvVariableTemp(StrL("SUMATRA_SCRIPTS"));
+    if (env && file::Exists(path::JoinTemp(env, StrL("package.json")))) {
+        return env;
     }
-    TempStr repo = StrL("C:\\workspace\\sumatrapdf\\scripts\\webview");
-    if (file::Exists(path::JoinTemp(repo, StrL("package.json")))) {
+    // Walk up from the EXE (out/dbg64 → repo root) looking for scripts/webview.
+    TempStr dir = GetSelfExeDirTemp();
+    for (int i = 0; i < 8 && dir; i++) {
+        TempStr candidate = path::JoinTemp(dir, StrL("scripts\\webview"));
+        if (file::Exists(path::JoinTemp(candidate, StrL("package.json")))) {
+            return candidate;
+        }
+        TempStr parent = path::GetDirTemp(dir);
+        if (!parent || str::EqI(parent, dir)) {
+            break;
+        }
+        dir = parent;
+    }
+    return {};
+}
+
+static void CopyScriptsWebviewFile(Str dstRoot, Str srcRoot, Str rel) {
+    TempStr src = path::JoinTemp(srcRoot, rel);
+    TempStr dst = path::JoinTemp(dstRoot, rel);
+    if (!file::Exists(src)) {
+        return;
+    }
+    dir::CreateAll(path::GetDirTemp(dst));
+    // Always refresh from repo so forks stay in sync with sources.
+    file::Copy(dst, src, false);
+}
+
+void EnsureScriptsWebviewLayout() {
+    // Copies ~15 files (into OneDrive by default) and is reached from many UI paths.
+    static bool synced = false;
+    if (synced) {
+        return;
+    }
+    synced = true;
+    TempStr src = FindRepoScriptsWebviewTemp();
+    if (!src) {
+        return;
+    }
+    TempStr dstRoot = path::JoinTemp(GetAppDataDirTemp(), StrL("scripts\\webview"));
+    dir::CreateAll(dstRoot);
+    dir::CreateAll(path::JoinTemp(dstRoot, StrL("lib")));
+    dir::CreateAll(path::JoinTemp(dstRoot, StrL("manager")));
+
+    // Source files only — never copy node_modules (forks run npm ci locally).
+    static const char* kFiles[] = {
+        "package.json",
+        "package-lock.json",
+        "config.json",
+        "manifest.json",
+        "README.md",
+        "cli.mjs",
+        "flywheel.mjs",
+        "watch-jobs.mjs",
+        "notebooklm-add.mjs",
+        "notebooklm-select.mjs",
+        "notebooklm-chat.mjs",
+        "lib/bridge.mjs",
+        "lib/config.mjs",
+        "lib/notebooklm.mjs",
+        "manager/editor.html",
+    };
+    for (const char* rel : kFiles) {
+        CopyScriptsWebviewFile(dstRoot, src, Str(rel));
+    }
+    if (!file::Exists(path::JoinTemp(dstRoot, StrL("node_modules\\playwright\\package.json")))) {
+        logf("EnsureScriptsWebviewLayout: synced scripts to '%s' — run: cd that folder && npm ci\n", dstRoot);
+    }
+}
+
+TempStr ScriptsWebviewDirTemp() {
+    EnsureScriptsWebviewLayout();
+
+    // 1) Explicit override
+    TempStr env = GetEnvVariableTemp(StrL("SUMATRA_SCRIPTS"));
+    if (env && file::Exists(path::JoinTemp(env, StrL("package.json")))) {
+        return env;
+    }
+    // 2) Synced appdata copy (OneDrive or portable) — preferred when npm-installed
+    TempStr app = path::JoinTemp(GetAppDataDirTemp(), StrL("scripts\\webview"));
+    if (file::Exists(path::JoinTemp(app, StrL("package.json")))) {
+        return app;
+    }
+    // 3) Repo next to the build tree (developer checkout)
+    TempStr repo = FindRepoScriptsWebviewTemp();
+    if (repo) {
         return repo;
     }
-    return od;
+    return app;
 }
 
 TempStr FindNodeExeTemp() {
@@ -3529,6 +4137,38 @@ void UpdateWebPanelDpi(MainWindow* win, int dpi) {
         win->webPanelLabel->font = GetAppSidebarLabelFontForDpi(dpi);
     }
     RelayoutWebPanel(win);
+}
+
+static void SetHeaderIcon(VirtIconButton* b, const char* svg) {
+    if (!b) {
+        return;
+    }
+    int sz = DpiScale(kPinIconPx);
+    b->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz);
+}
+
+void UpdateWebPanelIcons(MainWindow* win) {
+    if (!win) {
+        return;
+    }
+    SetHeaderIcon(win->webPanelBookmarksBtn, gIconBookmarks);
+    SetHeaderIcon(win->webPanelTabsBtn, gIconTabs);
+    SetHeaderIcon(win->webPanelHistoryBtn, gIconHistory);
+    SetHeaderIcon(win->webPanelExtensionsBtn, gIconExtensions);
+    SetHeaderIcon(win->webPanelNotebookLmBtn, gIconNotebookLm);
+    SetHeaderIcon(win->webPanelFocusPdfBtn, gIconTargetFocus);
+    SetHeaderIcon(win->webPanelRefreshBtn, kIconRefresh);
+    SetHeaderIcon(win->webBrowserBookmarksBtn, gIconBookmarks);
+    SetHeaderIcon(win->webBrowserTabsBtn, gIconTabs);
+    SetHeaderIcon(win->webBrowserHistoryBtn, gIconHistory);
+    SetHeaderIcon(win->webBrowserExtensionsBtn, gIconExtensions);
+    SetHeaderIcon(win->webBrowserRefreshBtn, kIconRefresh);
+    if (win->hwndWebPanelBox) {
+        HwndInvalidate(win->hwndWebPanelBox);
+    }
+    if (win->hwndWebBrowserBox) {
+        HwndInvalidate(win->hwndWebBrowserBox);
+    }
 }
 
 void UpdateWebPanelTheme(MainWindow* win) {
@@ -3900,10 +4540,13 @@ WebviewWnd* CreateWebBrowserTabWebView(MainWindow* win, Str url) {
     webView->defaultBackgroundColor = kColWhite;
     // Full desktop browsing (no mobile UA / touch emulation). Mobile mode
     // breaks slide captchas and overlay close clicks; keep mobile on AI panel only.
+    // Spoof Chrome (not Edge) so Gemini / Google AI pages use the correct fonts.
     webView->emulateMobile = false;
+    webView->userAgent = str::Dup(kChromeDesktopUserAgent);
     webView->dedicatedBrowserArgs = str::Dup(fmt("--remote-debugging-port=%d", kLibraryCdpPort));
     webView->enableBrowserExtensions = true;
-    webView->browserExtensionsDir = str::Dup(BrowserExtensionsInstalledDirTemp());
+    // Chrome overlays (Trancy, …) — LocalAppData, not git / not OneDrive.
+    webView->browserExtensionsDir = str::Dup(BrowserExtensionsOverlayDirTemp());
     webView->allowClipboardRead = true;
     webView->desiredVisible = false;
 
@@ -4166,8 +4809,12 @@ void OnWebBrowserHistoryButton(MainWindow* win) {
 }
 
 void OnWebBrowserRefresh(MainWindow* win) {
-    if (win && win->webBrowserWebView) {
-        win->webBrowserWebView->Reload();
+    if (!win) {
+        return;
+    }
+    ShowActiveWebBrowserTab(win);
+    if (win->webBrowserWebView) {
+        win->webBrowserWebView->Reload(true);
     }
 }
 
@@ -4435,11 +5082,15 @@ void LibraryOnActiveBookChanged(MainWindow* win, i64 bookId, int kindInt) {
     logf("LibraryOnActiveBookChanged t=%llu bookId=%lld kind=%s prevBrowserVis=%d\n", (u64)GetTickCount64(), bookId,
          kind == LibraryBookKind::Web ? StrL("web") : StrL("pdf"), win->uiState.webBrowserVisible ? 1 : 0);
     i64 prevBookId = win->activeLibraryBookId;
-    // Persist prior entry's AI visibility + tab bindings before switching.
-    if (prevBookId > 0 && prevBookId != bookId) {
+    // The AI panel only reflects prevBookId if its (deferred) apply ran; when the user
+    // skipped past it, saving would store another book's panel state under it.
+    bool panelShowsPrev = win->libraryAiStateReady && win->aiAppliedBookId == prevBookId;
+    // Persist prior entry's AI visibility only after restore finished — otherwise
+    // session tab switches wipe lastBookId's aiOpen=1 with a premature false.
+    if (prevBookId > 0 && prevBookId != bookId && panelShowsPrev) {
         SetBookAiPanelOpen(prevBookId, win->uiState.webPanelVisible);
     }
-    if (win->uiState.webPanelVisible) {
+    if (win->uiState.webPanelVisible && panelShowsPrev) {
         RememberPdfActiveTab(win);
     }
     if (win->uiState.webBrowserVisible &&
@@ -4485,7 +5136,7 @@ void LibraryOnActiveBookChanged(MainWindow* win, i64 bookId, int kindInt) {
         }
     }
     // Restore this book's AI open/closed + companion tabs (auto-load on startup / switch).
-    ApplyBookAiPanelVisibility(win, bookId, kind);
+    ScheduleApplyBookAi(win);
     SyncLibrarySelection(win);
     win->uiState.layout = {}; // force RelayoutFrame to apply slot sizes
     ScheduleUiUpdate(win, kUiRelayout | kUiNoToolbars);

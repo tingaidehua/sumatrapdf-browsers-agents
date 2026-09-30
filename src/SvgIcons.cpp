@@ -445,8 +445,31 @@ Pixmap* GetCachedPixmapForSvg(Str svg, int dx, int dy, Color fg, Color bg) {
     return px;
 }
 
-// Theme, DPI, and shutdown: every cached pixmap is in the current colors/size.
+// Pixmaps from earlier theme/DPI generations. Controls hold raw Pixmap* from
+// GetCachedPixmapForSvg() and not all of them are refreshed on theme/DPI change,
+// so freeing immediately left dangling pointers (AV in PixmapAsPremulBgra while
+// painting a header button). Icons are tiny; keep them until shutdown.
+static SvgPixmapCacheEntry* gRetiredSvgPixmaps = nullptr;
+
+static void RetireSvgPixmapCache() {
+    SvgPixmapCacheEntry* e = gSvgPixmapCache;
+    while (e) {
+        SvgPixmapCacheEntry* next = e->next;
+        e->next = gRetiredSvgPixmaps;
+        gRetiredSvgPixmaps = e;
+        e = next;
+    }
+    gSvgPixmapCache = nullptr;
+}
+
+// Theme and DPI: subsequent lookups render in the current colors/size.
 void DestroySvgPixmapIconsCache() {
+    RetireSvgPixmapCache();
+}
+
+void FreeSvgPixmapIconsCacheAtShutdown() {
     ListDelete(gSvgPixmapCache);
     gSvgPixmapCache = nullptr;
+    ListDelete(gRetiredSvgPixmaps);
+    gRetiredSvgPixmaps = nullptr;
 }

@@ -66,6 +66,7 @@ static Str ColumnTextDup(sqlite3_stmt* stmt, int col) {
 }
 
 static i64 NextSortPos(LibraryStore* store, i64 collectionId);
+static int CmpManualOrder(LibraryBook* a, LibraryBook* b);
 
 static LibraryBook* ReadBook(sqlite3_stmt* stmt) {
     auto* book = new LibraryBook();
@@ -160,6 +161,7 @@ CREATE TABLE IF NOT EXISTS collections (
   name TEXT NOT NULL,
   created_ms INTEGER NOT NULL,
   bg_color INTEGER NOT NULL DEFAULT 0,
+  sort_pos INTEGER NOT NULL DEFAULT 0,
   UNIQUE(parent_id, name COLLATE NOCASE)
 );
 CREATE TABLE IF NOT EXISTS book_collections (
@@ -182,7 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id);
 CREATE INDEX IF NOT EXISTS idx_book_collections_collection ON book_collections(collection_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_parent_name
   ON collections(COALESCE(parent_id, 0), name COLLATE NOCASE);
-PRAGMA user_version = 7;
+PRAGMA user_version = 8;
 COMMIT;
 )sql";
     return Exec(store, sql);
@@ -290,6 +292,34 @@ static bool MigrateToV7(LibraryStore* store) {
     return Exec(store, "PRAGMA user_version = 7");
 }
 
+static bool MigrateToV8(LibraryStore* store) {
+    bool needBackfill = false;
+    if (!TableHasColumn(store, "collections", "sort_pos")) {
+        if (!Exec(store, "ALTER TABLE collections ADD COLUMN sort_pos INTEGER NOT NULL DEFAULT 0")) {
+            return false;
+        }
+        needBackfill = true;
+    }
+    if (needBackfill) {
+        // Keep current alphabetical sibling order as the initial manual order.
+        if (!Exec(store, R"sql(
+UPDATE collections
+SET sort_pos = (
+  SELECT COUNT(*)
+  FROM collections other
+  WHERE COALESCE(other.parent_id, 0) = COALESCE(collections.parent_id, 0)
+    AND (
+      other.name COLLATE NOCASE < collections.name COLLATE NOCASE
+      OR (other.name COLLATE NOCASE = collections.name COLLATE NOCASE AND other.id < collections.id)
+    )
+);
+)sql")) {
+            return false;
+        }
+    }
+    return Exec(store, "PRAGMA user_version = 8");
+}
+
 static int SchemaVersion(LibraryStore* store) {
     sqlite3_stmt* stmt = Prepare(store, "PRAGMA user_version");
     if (!stmt) {
@@ -323,14 +353,14 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     int version = SchemaVersion(store);
-    if (version < 0 || version > 7) {
+    if (version < 0 || version > 8) {
         str::ReplaceWithCopy(&store->error, fmt("unsupported library database version: %d", version));
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
     }
-    if (version < 7) {
-        logf("LibraryStore migrating schema: v%d -> v7\n", version);
+    if (version < 8) {
+        logf("LibraryStore migrating schema: v%d -> v8\n", version);
     }
     if (!CreateSchema(store)) {
         sqlite3_close(store->db);
@@ -355,6 +385,11 @@ LibraryStore* LibraryStoreOpen(Str dbPath) {
         return store;
     }
     if (!MigrateToV7(store)) {
+        sqlite3_close(store->db);
+        store->db = nullptr;
+        return store;
+    }
+    if (!MigrateToV8(store)) {
         sqlite3_close(store->db);
         store->db = nullptr;
         return store;
@@ -806,17 +841,57 @@ Vec<LibraryBook*> LibraryStoreGetBooks(LibraryStore* store, LibraryBookScope sco
             return ((*a)->id > (*b)->id) - ((*a)->id < (*b)->id);
         });
     } else if (sort == LibrarySort::Manual) {
-        VecSort(books, [](LibraryBook* const* a, LibraryBook* const* b) -> int {
-            if ((*a)->sortPos != (*b)->sortPos) {
-                return ((*a)->sortPos > (*b)->sortPos) - ((*a)->sortPos < (*b)->sortPos);
-            }
-            int n = str::CmpNatural((*a)->title, (*b)->title);
-            if (n != 0) return n;
-            n = str::CmpNatural((*a)->path, (*b)->path);
-            if (n != 0) return n;
-            return ((*a)->id > (*b)->id) - ((*a)->id < (*b)->id);
-        });
+        VecSort(books, [](LibraryBook* const* a, LibraryBook* const* b) -> int { return CmpManualOrder(*a, *b); });
     }
+    return books;
+}
+
+static int CmpManualOrder(LibraryBook* a, LibraryBook* b) {
+    if (a->sortPos != b->sortPos) {
+        return (a->sortPos > b->sortPos) - (a->sortPos < b->sortPos);
+    }
+    int n = str::CmpNatural(a->title, b->title);
+    if (n != 0) return n;
+    n = str::CmpNatural(a->path, b->path);
+    if (n != 0) return n;
+    return (a->id > b->id) - (a->id < b->id);
+}
+
+Vec<LibraryBook*> LibraryStoreGetPlacedBooks(LibraryStore* store, Str filter) {
+    Vec<LibraryBook*> books;
+    if (!LibraryStoreIsOpen(store)) {
+        return books;
+    }
+    str::Builder sql;
+    sql.Append(
+        "SELECT b.id,b.path,b.title,b.open_count,b.reading_seconds,b.last_read_ms,p.sort_pos,b.bg_color,NULL,b.kind,"
+        "b.url,p.cid FROM (SELECT book_id,collection_id AS cid,sort_pos FROM book_collections "
+        "UNION ALL SELECT book_id,0 AS cid,sort_pos FROM manual_books) p JOIN books b ON b.id=p.book_id ");
+    if (filter) {
+        sql.Append("WHERE b.title LIKE ?1 ESCAPE '\\' OR b.path LIKE ?1 ESCAPE '\\' OR b.url LIKE ?1 ESCAPE '\\' ");
+    }
+    sqlite3_stmt* stmt = Prepare(store, CStrTemp(ToStr(sql)));
+    if (!stmt) {
+        return books;
+    }
+    if (filter) {
+        Str escaped = EscapeLikePattern(filter);
+        TempStr like = fmt("%%%s%%", escaped);
+        BindText(stmt, 1, like);
+        str::Free(escaped);
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        LibraryBook* book = ReadBook(stmt);
+        book->placementId = sqlite3_column_int64(stmt, 11);
+        books.Append(book);
+    }
+    sqlite3_finalize(stmt);
+    VecSort(books, [](LibraryBook* const* a, LibraryBook* const* b) -> int {
+        if ((*a)->placementId != (*b)->placementId) {
+            return ((*a)->placementId > (*b)->placementId) - ((*a)->placementId < (*b)->placementId);
+        }
+        return CmpManualOrder(*a, *b);
+    });
     return books;
 }
 
@@ -825,8 +900,10 @@ Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store) {
     if (!LibraryStoreIsOpen(store)) {
         return collections;
     }
-    sqlite3_stmt* stmt =
-        Prepare(store, "SELECT id,COALESCE(parent_id,0),kind,name,bg_color FROM collections ORDER BY name COLLATE NOCASE,id");
+    sqlite3_stmt* stmt = Prepare(
+        store,
+        "SELECT id,COALESCE(parent_id,0),kind,name,bg_color,sort_pos FROM collections "
+        "ORDER BY COALESCE(parent_id,0), sort_pos ASC, id ASC");
     if (!stmt) {
         return collections;
     }
@@ -837,15 +914,83 @@ Vec<LibraryCollection*> LibraryStoreGetCollections(LibraryStore* store) {
         collection->isShelf = sqlite3_column_int(stmt, 2) == 1;
         collection->name = ColumnTextDup(stmt, 3);
         collection->bgColor = (u32)sqlite3_column_int64(stmt, 4);
+        collection->sortPos = sqlite3_column_int64(stmt, 5);
         collections.Append(collection);
     }
     sqlite3_finalize(stmt);
-    VecSort(collections, [](LibraryCollection* const* a, LibraryCollection* const* b) -> int {
-        int n = str::CmpNatural((*a)->name, (*b)->name);
-        if (n != 0) return n;
-        return ((*a)->id > (*b)->id) - ((*a)->id < (*b)->id);
-    });
     return collections;
+}
+
+bool LibraryStoreSeedForTesting(LibraryStore* store, int nFolders, int booksPerFolder, int rootBooks) {
+    if (!LibraryStoreIsOpen(store) || nFolders < 0 || booksPerFolder < 0 || rootBooks < 0) {
+        return false;
+    }
+    if (!Exec(store, "BEGIN IMMEDIATE")) {
+        return false;
+    }
+    sqlite3_stmt* addCol = Prepare(
+        store, "INSERT INTO collections(parent_id,kind,name,created_ms,sort_pos) VALUES(NULL,2,?1,0,?2) RETURNING id");
+    sqlite3_stmt* addBook = Prepare(store,
+                                    "INSERT INTO books(path,path_key,title,created_ms,updated_ms) "
+                                    "VALUES(?1,?2,?3,0,0) RETURNING id");
+    sqlite3_stmt* inCol =
+        Prepare(store, "INSERT INTO book_collections(book_id,collection_id,added_ms,sort_pos) VALUES(?1,?2,0,?3)");
+    sqlite3_stmt* atRoot = Prepare(store, "INSERT INTO manual_books(book_id,added_ms,sort_pos) VALUES(?1,0,?2)");
+    bool ok = addCol && addBook && inCol && atRoot;
+    int serial = 0;
+    auto insertBook = [&](int idx) -> i64 {
+        TempStr path = fmt("C:\\seed\\f%03d\\book-%06d-some-long-title-for-width.pdf", idx / 1000, serial);
+        Str key = str::ToLower(path);
+        TempStr title = path::GetBaseNameTemp(path);
+        serial++;
+        sqlite3_reset(addBook);
+        BindText(addBook, 1, path);
+        BindText(addBook, 2, key);
+        BindText(addBook, 3, title);
+        i64 id = 0;
+        if (sqlite3_step(addBook) == SQLITE_ROW) {
+            id = sqlite3_column_int64(addBook, 0);
+        }
+        str::Free(key);
+        return id;
+    };
+    for (int f = 0; ok && f < nFolders; f++) {
+        sqlite3_reset(addCol);
+        BindText(addCol, 1, fmt("seed-folder-%04d", f));
+        sqlite3_bind_int64(addCol, 2, f);
+        if (sqlite3_step(addCol) != SQLITE_ROW) {
+            ok = false;
+            break;
+        }
+        i64 colId = sqlite3_column_int64(addCol, 0);
+        for (int i = 0; ok && i < booksPerFolder; i++) {
+            i64 bookId = insertBook(f);
+            sqlite3_reset(inCol);
+            sqlite3_bind_int64(inCol, 1, bookId);
+            sqlite3_bind_int64(inCol, 2, colId);
+            sqlite3_bind_int64(inCol, 3, i);
+            ok = bookId > 0 && sqlite3_step(inCol) == SQLITE_DONE;
+        }
+    }
+    for (int i = 0; ok && i < rootBooks; i++) {
+        i64 bookId = insertBook(nFolders);
+        sqlite3_reset(atRoot);
+        sqlite3_bind_int64(atRoot, 1, bookId);
+        sqlite3_bind_int64(atRoot, 2, i);
+        ok = bookId > 0 && sqlite3_step(atRoot) == SQLITE_DONE;
+    }
+    if (!ok) {
+        SetError(store, StrL("seed"));
+    }
+    sqlite3_finalize(addCol);
+    sqlite3_finalize(addBook);
+    sqlite3_finalize(inCol);
+    sqlite3_finalize(atRoot);
+    if (!ok || !Exec(store, "COMMIT")) {
+        Exec(store, "ROLLBACK");
+        return false;
+    }
+    return true;
 }
 
 static int CollectionKind(LibraryStore* store, i64 id) {
@@ -865,6 +1010,21 @@ static int CollectionKind(LibraryStore* store, i64 id) {
     return kind;
 }
 
+static i64 NextCollectionSortPos(LibraryStore* store, i64 parentId) {
+    sqlite3_stmt* stmt =
+        Prepare(store, "SELECT COALESCE(MAX(sort_pos), -1) + 1 FROM collections WHERE COALESCE(parent_id, 0)=?1");
+    if (!stmt) {
+        return 0;
+    }
+    sqlite3_bind_int64(stmt, 1, parentId);
+    i64 pos = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        pos = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return pos;
+}
+
 LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentId, bool isShelf, Str name) {
     if (!LibraryStoreIsOpen(store) || !name) {
         return nullptr;
@@ -881,8 +1041,9 @@ LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentI
             return nullptr;
         }
     }
-    sqlite3_stmt* stmt =
-        Prepare(store, "INSERT INTO collections(parent_id,kind,name,created_ms) VALUES(?1,?2,?3,?4) RETURNING id");
+    i64 sortPos = NextCollectionSortPos(store, parentId);
+    sqlite3_stmt* stmt = Prepare(
+        store, "INSERT INTO collections(parent_id,kind,name,created_ms,sort_pos) VALUES(?1,?2,?3,?4,?5) RETURNING id");
     if (!stmt) {
         return nullptr;
     }
@@ -893,6 +1054,7 @@ LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentI
     sqlite3_bind_int(stmt, 2, isShelf ? 1 : 2);
     BindText(stmt, 3, name);
     sqlite3_bind_int64(stmt, 4, UnixTimeMsNow());
+    sqlite3_bind_int64(stmt, 5, sortPos);
     LibraryCollection* result = nullptr;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         result = new LibraryCollection();
@@ -900,6 +1062,7 @@ LibraryCollection* LibraryStoreCreateCollection(LibraryStore* store, i64 parentI
         result->parentId = parentId;
         result->isShelf = isShelf;
         result->name = str::Dup(name);
+        result->sortPos = sortPos;
     } else {
         SetError(store, StrL("create collection"));
     }
@@ -1004,7 +1167,9 @@ SELECT 1 FROM descendants WHERE id=?2;
         return false;
     }
     // Preserve kind: folders remain folders even at root (tags at top level).
-    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET parent_id=?1 WHERE id=?2");
+    // Append at the end of the destination sibling list.
+    i64 sortPos = NextCollectionSortPos(store, newParentId);
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET parent_id=?1, sort_pos=?2 WHERE id=?3");
     if (!stmt) {
         return false;
     }
@@ -1013,13 +1178,231 @@ SELECT 1 FROM descendants WHERE id=?2;
     } else {
         sqlite3_bind_null(stmt, 1);
     }
-    sqlite3_bind_int64(stmt, 2, collectionId);
+    sqlite3_bind_int64(stmt, 2, sortPos);
+    sqlite3_bind_int64(stmt, 3, collectionId);
     bool ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
     if (!ok) {
         SetError(store, StrL("move collection"));
     }
     sqlite3_finalize(stmt);
     return ok;
+}
+
+static bool StepDone(sqlite3_stmt* stmt) {
+    if (!stmt) {
+        return false;
+    }
+    bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool MoveOrMergeCollection(LibraryStore* store, i64 srcId, i64 dstId, int depth);
+
+static bool MergeCollectionInto(LibraryStore* store, i64 srcId, i64 dstId, int depth) {
+    if (depth > 64) {
+        return false;
+    }
+    // Books keep their order, appended after the target's existing books.
+    i64 base = NextSortPos(store, dstId);
+    sqlite3_stmt* stmt = Prepare(store, R"sql(
+INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms,sort_pos)
+SELECT book_id, ?2, added_ms, ?3 + ROW_NUMBER() OVER (ORDER BY sort_pos, book_id) - 1
+FROM book_collections WHERE collection_id=?1;
+)sql");
+    if (stmt) {
+        sqlite3_bind_int64(stmt, 1, srcId);
+        sqlite3_bind_int64(stmt, 2, dstId);
+        sqlite3_bind_int64(stmt, 3, base);
+    }
+    if (!StepDone(stmt)) {
+        return false;
+    }
+    stmt = Prepare(store, "DELETE FROM book_collections WHERE collection_id=?1");
+    if (stmt) {
+        sqlite3_bind_int64(stmt, 1, srcId);
+    }
+    if (!StepDone(stmt)) {
+        return false;
+    }
+
+    Vec<LibraryCollection*> all = LibraryStoreGetCollections(store);
+    Vec<i64> children;
+    for (LibraryCollection* c : all) {
+        if (c->parentId == srcId) {
+            children.Append(c->id);
+        }
+    }
+    DeleteLibraryCollections(all);
+    for (i64 childId : children) {
+        if (!MoveOrMergeCollection(store, childId, dstId, depth + 1)) {
+            return false;
+        }
+    }
+    stmt = Prepare(store, "DELETE FROM collections WHERE id=?1");
+    if (stmt) {
+        sqlite3_bind_int64(stmt, 1, srcId);
+    }
+    return StepDone(stmt);
+}
+
+// Re-parent srcId under dstId (0 = library root); a same-named folder already there
+// (names are unique per parent, case-insensitive) absorbs it instead.
+static bool MoveOrMergeCollection(LibraryStore* store, i64 srcId, i64 dstId, int depth) {
+    Vec<LibraryCollection*> all = LibraryStoreGetCollections(store);
+    Str srcName = {};
+    for (LibraryCollection* c : all) {
+        if (c->id == srcId) {
+            srcName = c->name;
+        }
+    }
+    i64 sameId = 0;
+    for (LibraryCollection* c : all) {
+        if (c->parentId == dstId && c->id != srcId && str::EqI(c->name, srcName)) {
+            sameId = c->id;
+            break;
+        }
+    }
+    DeleteLibraryCollections(all);
+    if (sameId > 0) {
+        return MergeCollectionInto(store, srcId, sameId, depth);
+    }
+    i64 sortPos = NextCollectionSortPos(store, dstId);
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET parent_id=?1, sort_pos=?2 WHERE id=?3");
+    if (stmt) {
+        if (dstId > 0) {
+            sqlite3_bind_int64(stmt, 1, dstId);
+        } else {
+            sqlite3_bind_null(stmt, 1);
+        }
+        sqlite3_bind_int64(stmt, 2, sortPos);
+        sqlite3_bind_int64(stmt, 3, srcId);
+    }
+    return StepDone(stmt);
+}
+
+bool LibraryStoreRetagCollection(LibraryStore* store, i64 srcId, i64 dstId) {
+    if (!LibraryStoreIsOpen(store) || srcId <= 0 || dstId < 0) {
+        return false;
+    }
+    if (srcId == dstId) {
+        return true;
+    }
+    int srcKind = CollectionKind(store, srcId);
+    int dstKind = dstId == 0 ? 2 : CollectionKind(store, dstId);
+    if (srcKind != 2 || (dstKind != 1 && dstKind != 2)) {
+        str::ReplaceWithCopy(&store->error, StrL("only folders can be retagged, into a folder or shelf"));
+        return false;
+    }
+    Vec<LibraryCollection*> all = LibraryStoreGetCollections(store);
+    bool alreadyThere = false;
+    for (LibraryCollection* c : all) {
+        if (c->id == srcId) {
+            alreadyThere = c->parentId == dstId;
+        }
+    }
+    DeleteLibraryCollections(all);
+    if (alreadyThere) {
+        return true;
+    }
+    sqlite3_stmt* check = Prepare(store, R"sql(
+WITH RECURSIVE descendants(id) AS (
+  SELECT id FROM collections WHERE id=?1
+  UNION ALL
+  SELECT c.id FROM collections c JOIN descendants d ON c.parent_id=d.id
+)
+SELECT 1 FROM descendants WHERE id=?2;
+)sql");
+    if (!check) {
+        return false;
+    }
+    sqlite3_bind_int64(check, 1, srcId);
+    sqlite3_bind_int64(check, 2, dstId);
+    bool cycle = sqlite3_step(check) == SQLITE_ROW;
+    sqlite3_finalize(check);
+    if (cycle) {
+        str::ReplaceWithCopy(&store->error, StrL("target tag is inside the folder being retagged"));
+        return false;
+    }
+    if (!Exec(store, "BEGIN IMMEDIATE")) {
+        return false;
+    }
+    bool ok = MoveOrMergeCollection(store, srcId, dstId, 0);
+    if (!ok || !Exec(store, "COMMIT")) {
+        SetError(store, StrL("retag collection"));
+        Exec(store, "ROLLBACK");
+        return false;
+    }
+    return true;
+}
+
+bool LibraryStoreReorderCollection(LibraryStore* store, i64 collectionId, i64 parentId, i64 targetCollectionId,
+                                   bool insertAfter) {
+    if (!LibraryStoreIsOpen(store) || collectionId <= 0 || targetCollectionId <= 0 ||
+        collectionId == targetCollectionId || parentId < 0) {
+        return false;
+    }
+    Vec<LibraryCollection*> all = LibraryStoreGetCollections(store);
+    Vec<LibraryCollection*> siblings;
+    for (LibraryCollection* c : all) {
+        if (c->parentId == parentId) {
+            siblings.Append(c);
+        }
+    }
+    int sourceIdx = -1;
+    int targetIdx = -1;
+    for (int i = 0; i < len(siblings); i++) {
+        if (siblings[i]->id == collectionId) {
+            sourceIdx = i;
+        }
+        if (siblings[i]->id == targetCollectionId) {
+            targetIdx = i;
+        }
+    }
+    if (sourceIdx < 0 || targetIdx < 0) {
+        DeleteLibraryCollections(all);
+        return false;
+    }
+    LibraryCollection* moving = siblings[sourceIdx];
+    siblings.RemoveAt(sourceIdx);
+    if (sourceIdx < targetIdx) {
+        targetIdx--;
+    }
+    int insertIdx = insertAfter ? targetIdx + 1 : targetIdx;
+    if (insertIdx < 0) {
+        insertIdx = 0;
+    }
+    if (insertIdx > len(siblings)) {
+        insertIdx = len(siblings);
+    }
+    siblings.InsertAt(insertIdx, moving);
+
+    if (!Exec(store, "BEGIN IMMEDIATE")) {
+        DeleteLibraryCollections(all);
+        return false;
+    }
+    sqlite3_stmt* stmt = Prepare(store, "UPDATE collections SET sort_pos=?1 WHERE id=?2");
+    bool ok = stmt != nullptr;
+    for (int i = 0; ok && i < len(siblings); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        sqlite3_bind_int64(stmt, 1, i);
+        sqlite3_bind_int64(stmt, 2, siblings[i]->id);
+        ok = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(store->db) == 1;
+        if (!ok) {
+            SetError(store, StrL("reorder collection"));
+        }
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (!ok || !Exec(store, "COMMIT")) {
+        Exec(store, "ROLLBACK");
+        DeleteLibraryCollections(all);
+        return false;
+    }
+    DeleteLibraryCollections(all);
+    return true;
 }
 
 bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collectionId) {
@@ -1036,6 +1419,63 @@ bool LibraryStoreAddBookToCollection(LibraryStore* store, i64 bookId, i64 collec
     if (!ok) SetError(store, StrL("add book to collection"));
     sqlite3_finalize(stmt);
     return ok;
+}
+
+Vec<i64> LibraryStoreGetBookCollectionIds(LibraryStore* store, i64 bookId) {
+    Vec<i64> ids;
+    if (!LibraryStoreIsOpen(store) || bookId <= 0) return ids;
+    sqlite3_stmt* stmt = Prepare(store, "SELECT collection_id FROM book_collections WHERE book_id=?1");
+    if (!stmt) return ids;
+    sqlite3_bind_int64(stmt, 1, bookId);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ids.Append(sqlite3_column_int64(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return ids;
+}
+
+bool LibraryStoreAddBookTag(LibraryStore* store, i64 bookId, i64 collectionId) {
+    if (!LibraryStoreIsOpen(store) || bookId <= 0 || collectionId <= 0) return false;
+    if (!Exec(store, "BEGIN IMMEDIATE")) return false;
+    bool hadTags = false;
+    sqlite3_stmt* stmt = Prepare(store, "SELECT 1 FROM book_collections WHERE book_id=?1 LIMIT 1");
+    bool ok = stmt != nullptr;
+    if (stmt) {
+        sqlite3_bind_int64(stmt, 1, bookId);
+        hadTags = sqlite3_step(stmt) == SQLITE_ROW;
+        sqlite3_finalize(stmt);
+    }
+    if (ok) {
+        i64 sortPos = NextSortPos(store, collectionId);
+        stmt = Prepare(store,
+                       "INSERT OR IGNORE INTO book_collections(book_id,collection_id,added_ms,sort_pos) "
+                       "VALUES(?1,?2,?3,?4)");
+        ok = stmt != nullptr;
+        if (stmt) {
+            sqlite3_bind_int64(stmt, 1, bookId);
+            sqlite3_bind_int64(stmt, 2, collectionId);
+            sqlite3_bind_int64(stmt, 3, UnixTimeMsNow());
+            sqlite3_bind_int64(stmt, 4, sortPos);
+            ok = sqlite3_step(stmt) == SQLITE_DONE;
+            sqlite3_finalize(stmt);
+        }
+    }
+    if (ok && !hadTags) {
+        // first tag: the book moves out of the library root into the tag folder
+        stmt = Prepare(store, "DELETE FROM manual_books WHERE book_id=?1");
+        ok = stmt != nullptr;
+        if (stmt) {
+            sqlite3_bind_int64(stmt, 1, bookId);
+            ok = sqlite3_step(stmt) == SQLITE_DONE;
+            sqlite3_finalize(stmt);
+        }
+    }
+    if (!ok || !Exec(store, "COMMIT")) {
+        SetError(store, StrL("add book tag"));
+        Exec(store, "ROLLBACK");
+        return false;
+    }
+    return true;
 }
 
 static sqlite3_stmt* PrepareBookMembership(LibraryStore* store, i64 collectionId, bool insert) {
@@ -1675,6 +2115,20 @@ static void TestLibraryManualReorder() {
 
     DeleteLibraryCollection(cat);
     DeleteLibraryCollection(shelf);
+
+    LibraryCollection* shelf2 = LibraryStoreCreateCollection(store, 0, true, StrL("书架"));
+    LibraryCollection* web = LibraryStoreCreateCollection(store, 0, false, StrL("网页"));
+    utassert(shelf2 && web);
+    i64 idShelf = shelf2->id, idWeb = web->id;
+    DeleteLibraryCollection(shelf2);
+    DeleteLibraryCollection(web);
+    utassert(LibraryStoreReorderCollection(store, idWeb, 0, idShelf, false));
+    Vec<LibraryCollection*> cols = LibraryStoreGetCollections(store);
+    utassert(len(cols) >= 2);
+    utassert(cols[0]->id == idWeb && cols[0]->parentId == 0);
+    utassert(cols[1]->id == idShelf && cols[1]->parentId == 0);
+    DeleteLibraryCollections(cols);
+
     LibraryStoreClose(store);
     utassert(file::Delete(dbPath));
 }

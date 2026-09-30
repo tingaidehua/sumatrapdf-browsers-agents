@@ -112,7 +112,8 @@ struct WebviewWnd : WindowBase {
     void RemoveAllInitScripts();
     void OnInitScriptAdded(int token, const WCHAR* id);
     void Navigate(Str url);
-    void Reload();
+    // ignoreCache: Ctrl+F5 style (CDP Page.reload). Plain Reload() may reuse HTTP cache.
+    void Reload(bool ignoreCache = false);
     void Bind(Str name);
     void Unbind(Str name);
     void Resolve(Str id, int status, Str resultJson);
@@ -217,6 +218,9 @@ struct WebviewWnd : WindowBase {
     // 1.0 keeps 1 CSS px ≈ 1 HWND px (no crop). Higher values zoom/crop.
     float mobileDeviceScale = 1.0f;
     void ApplyMobileEmulation();
+    // When userAgent is set without emulateMobile, also push CDP UA + Chrome
+    // Client Hints (Gemini fonts break on Edge Sec-CH-UA brands).
+    void ApplyDesktopUserAgentOverride();
     void CallDevTools(Str method, Str paramsJson);
     Vec<PendingWebViewOp> pendingOps;
     Vec<WebViewInitScript> initScripts;

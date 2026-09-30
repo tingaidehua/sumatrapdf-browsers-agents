@@ -25,7 +25,7 @@ Cursor / node cli.mjs flywheel
 ```bash
 cd scripts/webview
 npm install
-npx playwright install chromium   # once
+# connectOverCDP uses the live Sumatra WebView2 — full Chromium download is optional
 
 # Full loop: build, restart exe, add PDF, ask NotebookLM
 node cli.mjs flywheel --pdf "C:\path\to\book.pdf" --bookId 37
@@ -94,8 +94,10 @@ Library context menu → **脚本管理**:
 
 | Location | Role |
 |----------|------|
-| `C:\workspace\sumatrapdf\scripts\webview\` | Source of truth |
-| `%OneDrive%\SumatraPDF\WebPanel\` | bridge + jobs + WebView2 profile |
-| `%OneDrive%\SumatraPDF\scripts\webview\` | optional runtime copy (exe prefers if present) |
+| `<repo>/scripts/webview/` | Source of truth in the git checkout |
+| `%OneDrive%\SumatraPDF\scripts\webview\` (or portable appdata) | Synced on launch from the repo; run `npm ci` here once |
+| `%OneDrive%\SumatraPDF\WebPanel\` | **Synced** small state: tabs, pdf-map, `bridge/web-bridge.json` |
+| `%LOCALAPPDATA%\SumatraPDF\WebPanel\` | **Local** heavy state: WebView2 profiles, jobs, favicon cache |
+| `SUMATRA_SCRIPTS` | Optional override directory (must contain `package.json`) |
 
-CDP default: **9224** (legacy sessions may still be on 9223 — CLI probes both).
+CDP: **9224** = Browser-AIChat (NotebookLM), **9225** = Browser-Library (center Web).

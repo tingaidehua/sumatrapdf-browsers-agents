@@ -262,7 +262,7 @@ TreeItem TreeView::GetSelection() {
 bool TreeView::SelectItem(TreeItem ti) {
     HTREEITEM hi = nullptr;
     if (ti != TreeModel::kNullItem) {
-        hi = GetHandleByTreeItem(ti);
+        hi = EnsureHandleByTreeItem(ti);
     }
     BOOL ok = TreeView_SelectItem(hwnd, hi);
     return ok == TRUE;
@@ -358,8 +358,13 @@ TreeItem TreeView::GetTreeItemByHandle(HTREEITEM item) {
     return res;
 }
 
-static void FillTVITEM(TVITEMEXW* tvitem, TreeModel* tm, TreeItem ti) {
+static void FillTVITEM(TVITEMEXW* tvitem, TreeModel* tm, TreeItem ti, bool lazyPlaceholder = false) {
     uint mask = TVIF_TEXT | TVIF_PARAM | TVIF_STATE;
+    if (lazyPlaceholder) {
+        // children not inserted yet: still show the expand button
+        mask |= TVIF_CHILDREN;
+        tvitem->cChildren = 1;
+    }
     tvitem->mask = mask;
 
     uint stateMask = TVIS_EXPANDED;
@@ -377,21 +382,23 @@ static void FillTVITEM(TVITEMEXW* tvitem, TreeModel* tm, TreeItem ti) {
 
 // inserting in front is faster:
 // https://devblogs.microsoft.com/oldnewthing/20111125-00/?p=9033
-static HTREEITEM insertItemFront(TreeView* treeView, TreeItem ti, HTREEITEM parent) {
+static HTREEITEM insertItemAfter(TreeView* treeView, TreeItem ti, HTREEITEM parent, HTREEITEM after,
+                                 bool lazyPlaceholder) {
     TVINSERTSTRUCTW toInsert{};
 
     toInsert.hParent = parent;
-    toInsert.hInsertAfter = TVI_FIRST;
+    toInsert.hInsertAfter = after;
 
     TVITEMEXW* tvitem = &toInsert.itemex;
-    FillTVITEM(tvitem, treeView->treeModel, ti);
+    FillTVITEM(tvitem, treeView->treeModel, ti, lazyPlaceholder);
     HTREEITEM res = TreeView_InsertItem(treeView->hwnd, &toInsert);
     return res;
 }
 
 bool TreeView::UpdateItem(TreeItem ti) {
     HTREEITEM ht = GetHandleByTreeItem(ti);
-    ReportIf(!ht);
+    // with lazyChildren the item may not be inserted yet; it picks up the model text when it is
+    ReportIf(!ht && !lazyChildren);
     if (!ht) {
         return false;
     }
@@ -419,12 +426,166 @@ static void PopulateTreeItem(TreeView* treeView, TreeItem item, HTREEITEM parent
 
     for (int i = 0; i < n; i++) {
         auto ti = a[i];
-        HTREEITEM h = insertItemFront(treeView, ti, parent);
+        bool hasChildren = tm->ChildCount(ti) > 0;
+        bool deferChildren = hasChildren && treeView->lazyChildren && !tm->IsExpanded(ti);
+        HTREEITEM h = insertItemAfter(treeView, ti, parent, TVI_FIRST, deferChildren);
         tm->SetUserData(ti, (uintptr_t)h);
         // avoid recursing if not needed because we use a lot of stack space
-        if (tm->ChildCount(ti) > 0) {
+        if (hasChildren && !deferChildren) {
             PopulateTreeItem(treeView, ti, h);
         }
+    }
+}
+
+// lazyChildren: insert the children of an item that was added as a placeholder
+static void PopulateDeferredChildren(TreeView* treeView, TreeItem ti, HTREEITEM hItem) {
+    if (!hItem || ti == TreeModel::kNullItem || TreeView_GetChild(treeView->hwnd, hItem)) {
+        return;
+    }
+    if (treeView->treeModel->ChildCount(ti) > 0) {
+        PopulateTreeItem(treeView, ti, hItem);
+        return;
+    }
+    TVITEMW it{};
+    it.mask = TVIF_HANDLE | TVIF_CHILDREN;
+    it.hItem = hItem;
+    it.cChildren = 0;
+    TreeView_SetItem(treeView->hwnd, &it);
+}
+
+HTREEITEM TreeView::EnsureHandleByTreeItem(TreeItem ti) {
+    if (!treeModel || ti == TreeModel::kNullItem) {
+        return nullptr;
+    }
+    HTREEITEM h = GetHandleByTreeItem(ti);
+    if (h || !lazyChildren) {
+        return h;
+    }
+    TreeItem parent = treeModel->Parent(ti);
+    if (parent == TreeModel::kNullItem || parent == treeModel->Root()) {
+        return nullptr;
+    }
+    HTREEITEM hParent = EnsureHandleByTreeItem(parent);
+    PopulateDeferredChildren(this, parent, hParent);
+    return GetHandleByTreeItem(ti);
+}
+
+static bool SortedContains(const Vec<i64>& sorted, i64 key) {
+    int lo = 0;
+    int hi = len(sorted) - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (sorted[mid] == key) {
+            return true;
+        }
+        if (sorted[mid] < key) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return false;
+}
+
+static void DeleteTreeChildren(HWND hwnd, HTREEITEM hParent) {
+    HTREEITEM h = TreeView_GetChild(hwnd, hParent);
+    while (h) {
+        HTREEITEM next = TreeView_GetNextSibling(hwnd, h);
+        TreeView_DeleteItem(hwnd, h);
+        h = next;
+    }
+}
+
+static void SyncTreeChildren(TreeView* tv, TreeModel* oldTm, TreeItem item, HTREEITEM hParent);
+
+// hItem shows an item of the old model that has the same StableKey as ti
+static void SyncReusedItem(TreeView* tv, TreeModel* oldTm, TreeItem oldTi, TreeItem ti, HTREEITEM hItem) {
+    TreeModel* tm = tv->treeModel;
+    HWND hwnd = tv->hwnd;
+    tm->SetUserData(ti, (uintptr_t)hItem);
+
+    TVITEMEXW it{};
+    it.hItem = hItem;
+    it.mask = TVIF_HANDLE | TVIF_PARAM | TVIF_STATE;
+    it.lParam = (LPARAM)ti;
+    it.stateMask = TVIS_EXPANDED;
+    Str text = tm->Text(ti);
+    if (!str::Eq(text, oldTm->Text(oldTi))) {
+        it.mask |= TVIF_TEXT;
+        it.pszText = CWStrTemp(text);
+    }
+
+    int n = tm->ChildCount(ti);
+    bool expand = n > 0 && tm->IsExpanded(ti);
+    bool populated = TreeView_GetChild(hwnd, hItem) != nullptr;
+    if (n == 0) {
+        if (populated) {
+            DeleteTreeChildren(hwnd, hItem);
+        }
+        it.mask |= TVIF_CHILDREN;
+        it.cChildren = 0;
+    } else if (populated || expand || !tv->lazyChildren) {
+        SyncTreeChildren(tv, oldTm, ti, hItem);
+    } else {
+        it.mask |= TVIF_CHILDREN;
+        it.cChildren = 1;
+    }
+    it.state = expand ? TVIS_EXPANDED : 0;
+    TreeView_SetItem(hwnd, &it);
+}
+
+static void SyncTreeChildren(TreeView* tv, TreeModel* oldTm, TreeItem item, HTREEITEM hParent) {
+    TreeModel* tm = tv->treeModel;
+    HWND hwnd = tv->hwnd;
+    int n = tm->ChildCount(item);
+    Vec<i64> keys;
+    for (int i = 0; i < n; i++) {
+        keys.Append(tm->StableKey(tm->ChildAt(item, i)));
+    }
+    Vec<i64> sortedKeys;
+    sortedKeys.Append(keys.els, len(keys));
+    VecSort(sortedKeys, [](const i64* a, const i64* b) -> int { return (*a > *b) - (*a < *b); });
+
+    HTREEITEM h = hParent ? TreeView_GetChild(hwnd, hParent) : TreeView_GetRoot(hwnd);
+    HTREEITEM prev = TVI_FIRST;
+    for (int i = 0; i < n; i++) {
+        TreeItem ti = tm->ChildAt(item, i);
+        i64 key = keys[i];
+        TreeItem reuse = TreeModel::kNullItem;
+        while (h) {
+            TreeItem oldTi = tv->GetTreeItemByHandle(h);
+            i64 oldKey = oldTi ? oldTm->StableKey(oldTi) : 0;
+            if (key != 0 && oldKey == key) {
+                reuse = oldTi;
+                break;
+            }
+            if (oldKey != 0 && SortedContains(sortedKeys, oldKey)) {
+                // still wanted further down: insert the new row in front of it
+                break;
+            }
+            HTREEITEM next = TreeView_GetNextSibling(hwnd, h);
+            TreeView_DeleteItem(hwnd, h);
+            h = next;
+        }
+        if (reuse != TreeModel::kNullItem) {
+            SyncReusedItem(tv, oldTm, reuse, ti, h);
+            prev = h;
+            h = TreeView_GetNextSibling(hwnd, h);
+            continue;
+        }
+        bool hasChildren = tm->ChildCount(ti) > 0;
+        bool deferChildren = hasChildren && tv->lazyChildren && !tm->IsExpanded(ti);
+        HTREEITEM nh = insertItemAfter(tv, ti, hParent, prev, deferChildren);
+        tm->SetUserData(ti, (uintptr_t)nh);
+        if (hasChildren && !deferChildren) {
+            PopulateTreeItem(tv, ti, nh);
+        }
+        prev = nh;
+    }
+    while (h) {
+        HTREEITEM next = TreeView_GetNextSibling(hwnd, h);
+        TreeView_DeleteItem(hwnd, h);
+        h = next;
     }
 }
 
@@ -442,10 +603,14 @@ void TreeView::SetTreeModel(TreeModel* tm) {
     CancelInProgressInteraction(hwnd);
     SuspendRedraw();
 
-    TreeView_DeleteAllItems(hwnd);
-
+    TreeModel* oldTm = treeModel;
     treeModel = tm;
-    PopulateTree(this, tm);
+    if (reuseRowsOnSetModel && oldTm && oldTm != tm) {
+        SyncTreeChildren(this, oldTm, tm->Root(), nullptr);
+    } else {
+        TreeView_DeleteAllItems(hwnd);
+        PopulateTree(this, tm);
+    }
     ResumeRedraw();
 
     uint flags = RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN;
@@ -611,8 +776,39 @@ void TreeView::OnNotifyReflect(ControlBase::NotifyReflectEvent* rev) {
         return;
     }
 
+    // https://docs.microsoft.com/en-us/windows/win32/controls/tvn-itemexpanding
+    if (code == TVN_ITEMEXPANDING) {
+        if (w->lazyChildren && (nmtv->action & TVE_EXPAND)) {
+            HTREEITEM hItem = nmtv->itemNew.hItem;
+            PopulateDeferredChildren(w, GetTreeItemByHandle(hItem), hItem);
+        }
+        if (w->preserveScrollOnExpand) {
+            w->expandScrollAnchor = TreeView_GetFirstVisible(w->hwnd);
+        }
+        rev->result = 0;
+        return;
+    }
+
     // https://docs.microsoft.com/en-us/windows/win32/controls/tvn-itemexpanded
     if (code == TVN_ITEMEXPANDED) {
+        if (w->preserveScrollOnExpand && w->expandScrollAnchor) {
+            HTREEITEM anchor = w->expandScrollAnchor;
+            w->expandScrollAnchor = nullptr;
+            // SelectSetFirstVisible also changes selection — restore caret after.
+            RECT rc{};
+            if (TreeView_GetItemRect(w->hwnd, anchor, &rc, FALSE)) {
+                HTREEITEM hSel = TreeView_GetSelection(w->hwnd);
+                SendMessageW(w->hwnd, WM_SETREDRAW, FALSE, 0);
+                TreeView_SelectSetFirstVisible(w->hwnd, anchor);
+                if (hSel) {
+                    TreeView_SelectItem(w->hwnd, hSel);
+                }
+                SendMessageW(w->hwnd, WM_SETREDRAW, TRUE, 0);
+                RedrawWindow(w->hwnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+            }
+        } else {
+            w->expandScrollAnchor = nullptr;
+        }
         if (onExpansionChanged.IsValid()) {
             onExpansionChanged.Call();
         }

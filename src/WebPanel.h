@@ -9,8 +9,16 @@ void RelayoutWebPanel(MainWindow* win);
 void OnWebPanelToggle(MainWindow* win);
 void CloseWebPanel(MainWindow* win);
 void WebPanelOnDocumentChanged(MainWindow* win);
+// Flush current book's AI open/closed (+ tab bindings) to pdf-map.json.
+void WebPanelPersistActiveBookAiState(MainWindow* win);
+// Restore last book's AI open/closed after CreateWebPanel / session tab load.
+void DeferredApplyLastBookAi(MainWindow* win);
+// Coalesced DeferredApplyLastBookAi: runs once input has been processed.
+void ScheduleApplyBookAi(MainWindow* win);
 void UpdateWebPanelDpi(MainWindow* win, int dpi);
 void UpdateWebPanelTheme(MainWindow* win);
+// Re-fetch header icons after the SVG icon cache was reset (theme / DPI).
+void UpdateWebPanelIcons(MainWindow* win);
 bool IsWebPanelVisible(MainWindow* win);
 
 // Center Web browser surface (canvas XOR). Shares WebView2 env/CDP with AI panel.
@@ -42,6 +50,9 @@ void WebPanelClearPdfTabUrls(i64 bookId);
 void WebPanelShowAiTabBindings(MainWindow* win, i64 bookId);
 void WebPanelPollBridgeResults();
 TempStr ScriptsWebviewDirTemp();
+// Repo / SUMATRA_SCRIPTS checkout that contains package.json (may be empty).
+TempStr FindRepoScriptsWebviewTemp();
+void EnsureScriptsWebviewLayout();
 void WebPanelSpawnScript(Str scriptName, Str extraArgs = {});
 // -dbg-control TestWebPanel: show|hide|status|add|poll (AI/Cursor closed loop).
 TempStr WebPanelDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exitCodeOut);

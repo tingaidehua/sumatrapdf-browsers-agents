@@ -102,6 +102,21 @@ static void logToPipe(Str s) {
     gPipeMutex.Unlock();
 }
 
+// ms since process creation, so log lines show time spent before logging started too
+static double MsSinceProcessStart() {
+    static u64 creation = 0;
+    if (creation == 0) {
+        FILETIME c, e, k, u;
+        if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+            creation = ((u64)c.dwHighDateTime << 32) | c.dwLowDateTime;
+        }
+    }
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    u64 n = ((u64)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    return creation ? (double)(n - creation) / 10000.0 : 0.0;
+}
+
 void log(Str s) {
     bool skipLog = gSkipDuplicateLines && gLogBuf && str::Contains(*gLogBuf, s);
 
@@ -154,6 +169,13 @@ void log(Str s) {
     if (gLogFilePath) {
         auto* f = fopen(gLogFilePath.s, "a");
         if (f != nullptr) {
+            static bool atLineStart = true;
+            if (atLineStart) {
+                char ts[32];
+                int tsLen = snprintf(ts, sizeof(ts), "[%7.1f] ", MsSinceProcessStart());
+                fwrite(ts, 1, (size_t)tsLen, f);
+            }
+            atLineStart = n > 0 && s.s[n - 1] == '\n';
             fwrite(s.s, 1, n, f);
             fflush(f);
             fclose(f);

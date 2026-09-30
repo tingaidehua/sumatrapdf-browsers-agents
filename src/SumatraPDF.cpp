@@ -3316,6 +3316,8 @@ void UpdateAfterThemeChange() {
         RefreshSelectionToolbarIcons(win);
         UpdateAIChatTheme(win);
         UpdateWebPanelTheme(win);
+        UpdateWebPanelIcons(win);
+        UpdateLibraryPanelIcons(win);
         DarkModeApplyToFrameAfterThemeChange(win);
         UpdateWindowFrameBorderColor(win);
         // TODO: this only rerenders canvas, not frame, even with
@@ -4237,7 +4239,13 @@ void StartLoadDocument(LoadArgs* argsIn) {
         tab->loadState = WindowTab::LoadState::Loading;
         argsIn->targetTab = AddTabToWindow(win, tab);
         win->currentTabTemp = argsIn->targetTab;
-        LoadModelIntoTab(argsIn->targetTab);
+        if (gRestoringSessionTabs) {
+            // switching into every restored tab costs a full UI update each; the
+            // selected one is switched into once restore is done
+            win->ctrl = nullptr;
+        } else {
+            LoadModelIntoTab(argsIn->targetTab);
+        }
     } else if (argsIn->forceReuse && win->CurrentTab() && !win->IsCurrentTabAbout()) {
         // Reuse current tab (next/prev in folder, navigate dialog, etc.): drop the
         // old document immediately so the canvas paints the standard "Loading ..."
@@ -4467,6 +4475,27 @@ MainWindow* LoadDocument(LoadArgs* args) {
     return result;
 }
 
+bool gRestoringSessionTabs = false;
+
+void SyncSidePanelsToCurrentTab(MainWindow* win) {
+    bool aiChatWas = win->uiState.aiChatVisible;
+    bool webWas = win->uiState.webPanelVisible;
+    AIChatSyncPanelsToCurrentTab(win);
+    if (win->uiState.aiChatVisible) {
+        win->uiState.webPanelVisible = false;
+    }
+    if (aiChatWas != win->uiState.aiChatVisible || webWas != win->uiState.webPanelVisible) {
+        ScheduleUiUpdate(win);
+    }
+    OnAIChatTabChanged(win);
+    WebPanelOnDocumentChanged(win);
+    // Re-apply after session restore settles (CreateWebPanel's deferred apply
+    // often runs before the document/library book id is known).
+    ScheduleApplyBookAi(win);
+    LibraryUpdateReadingActivity();
+    SyncLibrarySelection(win);
+}
+
 // Loads document data into the MainWindow.
 void LoadModelIntoTab(WindowTab* tab) {
     if (!tab) {
@@ -4647,19 +4676,9 @@ void LoadModelIntoTab(WindowTab* tab) {
     ShowPageInfoIfWanted(win);
 
     if (IsMainWindowValid(win)) {
-        bool aiChatWas = win->uiState.aiChatVisible;
-        bool webWas = win->uiState.webPanelVisible;
-        AIChatSyncPanelsToCurrentTab(win);
-        if (win->uiState.aiChatVisible) {
-            win->uiState.webPanelVisible = false;
+        if (!gRestoringSessionTabs) {
+            SyncSidePanelsToCurrentTab(win);
         }
-        if (aiChatWas != win->uiState.aiChatVisible || webWas != win->uiState.webPanelVisible) {
-            ScheduleUiUpdate(win);
-        }
-        OnAIChatTabChanged(win);
-        WebPanelOnDocumentChanged(win);
-        LibraryUpdateReadingActivity();
-        SyncLibrarySelection(win);
         logf("LoadModelIntoTab: end path='%s' tocVis=%d libraryDx=%d sidebarDx=%d elapsedMs=%llu\n",
              tab->filePath ? tab->filePath : StrL(""), win->uiState.tocVisible ? 1 : 0, win->libraryDx, win->sidebarDx,
              GetTickCount64() - switchStart);
@@ -5575,6 +5594,9 @@ void CloseWindow(MainWindow* win, bool quitIfLast, bool forceClose) {
             return;
         }
     }
+
+    // Flush per-book AI sidebar open/closed before prefs so restart restores it.
+    WebPanelPersistActiveBookAiState(win);
 
     // if this is a last window, save state before closing window
     // if not last, save after closing window (#5418)
@@ -7017,6 +7039,9 @@ static bool RelayoutFrame(MainWindow* win, bool updateToolbars, int sidebarDx, b
     // actual native height instead of reserving a second chrome row.
     win->toolbarTopSlot->dy = rebarDy;
     win->captionToolbarSlot->dy = rebarDy;
+    // The caption row splits its free width between the toolbar, tabs and drag area; without a
+    // natural width the toolbar only got a share of it and its right-most buttons were clipped.
+    win->captionToolbarSlot->dx = showToolbar ? ToolbarNaturalWidth(win) : 0;
 
     int tabHeight = GetTabbarHeight(win->hwndFrame);
     if (showCaption) {
@@ -7581,7 +7606,11 @@ static void ApplyMainWindowDpiChromeRefresh(MainWindow* win, HWND hwnd) {
         RecreateFindBar(other);
         UpdateFindWindowTheme(other);
         RefreshSelectionToolbarIcons(other);
+        UpdateWebPanelIcons(other);
+        UpdateLibraryPanelIcons(other);
     }
+    UpdateWebPanelIcons(win);
+    UpdateLibraryPanelIcons(win);
 
     bool menuRebarVisible = IsShowingMenuBarRebar(win);
     if (menuRebarVisible) {
@@ -14354,7 +14383,7 @@ TempStr WindowStateDuringLoadResultTemp(int* exitCodeOut) {
 void ShutdownCleanup() {
     TtsRelease();
     FreeHomePageTips();
-    DestroySvgPixmapIconsCache();
+    FreeSvgPixmapIconsCacheAtShutdown();
     DisconnectLastDragDataObject();
 
     gAllowedFileTypes.Reset();

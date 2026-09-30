@@ -334,6 +334,23 @@ void TabsSelect(MainWindow* win, int tabIndex) {
     LoadModelIntoTab(tab);
 }
 
+// like TabsSelect but also loads the tab if it is already the selected one
+void TabsSelectForce(MainWindow* win, int tabIndex) {
+    auto tabs = win->Tabs();
+    int nTabs = len(tabs);
+    if (nTabs == 0) {
+        return;
+    }
+    if (tabIndex < 0 || tabIndex >= nTabs) {
+        tabIndex = 0;
+    }
+    if (win->tabsCtrl->GetSelected() != tabIndex) {
+        TabsSelect(win, tabIndex);
+        return;
+    }
+    LoadModelIntoTab(tabs[tabIndex]);
+}
+
 // clang-format off
 extern bool SaveAnnotationsToExistingFile(WindowTab*);
 extern bool SaveAnnotationsToMaybeNewPdfFile(WindowTab*);

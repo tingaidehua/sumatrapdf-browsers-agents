@@ -663,10 +663,10 @@ bool ShouldOverlayToolbar(MainWindow* win) {
 
 // natural width of the toolbar content (buttons + page box); the find bar
 // floats separately so the page-total label is the rightmost element
-static int ToolbarNaturalWidth(MainWindow* win) {
-    ToolbarVirt* tb = win->toolbarVirt;
-    VirtHost* host = ToolbarHost(win);
-    if (!host || !host->layout) {
+int ToolbarNaturalWidth(MainWindow* win) {
+    ToolbarVirt* tb = win ? win->toolbarVirt : nullptr;
+    VirtHost* host = win ? ToolbarHost(win) : nullptr;
+    if (!tb || !host || !host->layout) {
         return 0;
     }
     int dx = host->layout->MinIntrinsicWidth(tb->rowDy);

@@ -1133,6 +1133,10 @@ static void WinTtsStop() {
 
 //--- public interface, dispatches to one of the implementations
 
+// voice chosen before the backend was initialized; applied on first real use
+// so that startup doesn't pay for WinRT / SAPI initialization
+static bool gTtsVoicePending = false;
+
 static bool IsWinRtBackend() {
     if (gTtsBackend == TtsBackend::Unknown) {
         // an escape hatch, also for testing the SAPI implementation
@@ -1143,6 +1147,21 @@ static bool IsWinRtBackend() {
         } else {
             gTtsBackend = TtsBackend::Sapi;
             log("Tts: using SAPI\n");
+        }
+        if (gTtsVoicePending) {
+            gTtsVoicePending = false;
+            bool isWinRt = gTtsBackend == TtsBackend::WinRt;
+            Str voiceId = gTtsVoiceId;
+            bool ok = isWinRt ? WinTtsSetVoiceById(voiceId) : SapiSetVoiceById(voiceId);
+            if (!ok && len(voiceId) > 0) {
+                logf("Tts: voice '%s' not available, using system default\n", voiceId);
+                str::FreePtr(&gTtsVoiceId);
+                if (isWinRt) {
+                    WinTtsSetVoiceById(Str{});
+                } else {
+                    SapiSetVoiceById(Str{});
+                }
+            }
         }
     }
     return gTtsBackend == TtsBackend::WinRt;
@@ -1239,6 +1258,11 @@ Vec<TtsVoiceInfo> TtsGetVoices() {
 }
 
 bool TtsSetVoiceById(Str voiceId) {
+    if (gTtsBackend == TtsBackend::Unknown) {
+        str::ReplacePtr(&gTtsVoiceId, len(voiceId) > 0 ? str::Dup(voiceId) : Str{});
+        gTtsVoicePending = true;
+        return true;
+    }
     bool ok;
     if (IsWinRtBackend()) {
         ok = WinTtsSetVoiceById(voiceId);

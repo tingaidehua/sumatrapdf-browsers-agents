@@ -9,6 +9,8 @@ constexpr int kLibraryLeftGutterDip = 3;
 void CreateLibraryPanel(MainWindow* win);
 void LayoutLibraryPanel(MainWindow* win);
 void UpdateLibraryPanelText(MainWindow* win);
+// Re-fetch header icons after the SVG icon cache was reset (theme / DPI).
+void UpdateLibraryPanelIcons(MainWindow* win);
 void RefreshLibraryPanel(MainWindow* win);
 void RefreshLibraryPanels();
 void SyncLibrarySelection(MainWindow* win);

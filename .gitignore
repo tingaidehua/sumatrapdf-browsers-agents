@@ -75,6 +75,11 @@ Desktop.ini
 extensions/README.txt
 extensions/**/README.txt
 
+# Chrome/WebView2 overlay payloads — runtime materialize only (never commit)
+extensions/overlay/
+extensions/installed/trancy/
+**/extensions/overlay/
+
 # Local OneDrive / WebPanel dumps if ever copied into the tree
 WebPanel/
 **/Browser-AIChat/
@@ -82,3 +87,4 @@ WebPanel/
 **/jobs/pending/
 **/jobs/done/
 **/jobs/failed/
+tests/

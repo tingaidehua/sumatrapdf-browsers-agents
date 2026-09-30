@@ -436,6 +436,16 @@ static void RestoreTabOnStartup(MainWindow* win, TabState* state, bool lazyLoad 
         RestoreMissingTabOnStartup(win, state);
         return;
     }
+    if (lazyLoad && SettingsUseTabs()) {
+        // Only create the tab; the selected tab is loaded after all tabs are added
+        // and the rest load when first activated. Going through LoadDocument here
+        // switched into (and loaded) every restored tab.
+        WindowTab* tab = new WindowTab(win);
+        tab->SetFilePath(state->filePath);
+        tab->tabState = state;
+        AddTabToWindow(win, tab);
+        return;
+    }
     LoadArgs args(state->filePath, win);
     args.noSavePrefs = true;
     args.showWin = false;
@@ -2682,6 +2692,7 @@ ContinueOpenWindow:
         for (SessionData* data : *gInitialSessionData) {
             // create window hidden to avoid flashing the about page
             win = CreateAndShowMainWindow(data, false);
+            gRestoringSessionTabs = true;
             for (TabState* state : *data->tabStates) {
                 if (len(state->filePath) == 0) {
                     logf("WinMain: skipping RestoreTabOnStartup() because state->filePath is empty\n");
@@ -2719,13 +2730,18 @@ ContinueOpenWindow:
                 } else if (firstDocIdx >= 0) {
                     selectIdx = firstDocIdx;
                 }
-                TabsSelect(win, selectIdx);
+                // restored tabs were only added, never switched into, so even an
+                // already selected tab still needs LoadModelIntoTab
+                TabsSelectForce(win, selectIdx);
             }
-            if (gGlobalPrefs->lazyLoading) {
+            WindowTab* currTab = win->CurrentTab();
+            if (gGlobalPrefs->lazyLoading && currTab && !currTab->IsDocLoaded()) {
                 // trigger loading of the document
                 ReloadDocument(win, false);
             }
+            gRestoringSessionTabs = false;
             ShowMainWindow(win, data->windowState);
+            logf("WinMain: session window shown (%d tabs)\n", len(win->Tabs()));
             // Docs were loaded while the frame was hidden (normal windowPos size).
             // After show / maximize / fullscreen, force DisplayModel to match the
             // final canvas so scroll isn't stuck on the pre-show viewport
@@ -2733,6 +2749,10 @@ ContinueOpenWindow:
             if (win->IsDocLoaded()) {
                 win->canvasRc = {};
                 win->UpdateCanvasSize();
+            }
+            // after showing: this creates the AI panel's WebView2 (~300 ms)
+            if (IsMainWindowValid(win)) {
+                SyncSidePanelsToCurrentTab(win);
             }
         }
     }

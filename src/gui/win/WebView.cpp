@@ -1640,6 +1640,8 @@ void WebviewWnd::OnControllerReady(ICoreWebView2Controller* controller) {
 
     if (emulateMobile) {
         ApplyMobileEmulation();
+    } else if (userAgent) {
+        ApplyDesktopUserAgentOverride();
     }
     if (enableBrowserExtensions) {
         InstallBrowserExtensionsFromDir();
@@ -2015,10 +2017,17 @@ void WebviewWnd::Navigate(Str url) {
     webview->Navigate(ws);
 }
 
-void WebviewWnd::Reload() {
-    if (webview) {
-        webview->Reload();
+void WebviewWnd::Reload(bool ignoreCache) {
+    if (!webview) {
+        return;
     }
+    if (ignoreCache) {
+        // Hard refresh — starts a real network reload immediately (soft Reload()
+        // often reuses cache; Gemini/NotebookLM then look "stuck" for a beat).
+        CallDevTools(StrL("Page.reload"), StrL("{\"ignoreCache\":true}"));
+        return;
+    }
+    webview->Reload();
 }
 
 void WebviewWnd::GoBack() {
@@ -2576,6 +2585,38 @@ void WebviewWnd::ApplyMobileEmulation() {
     }
 }
 
+void WebviewWnd::ApplyDesktopUserAgentOverride() {
+    if (!webview || !userAgent || emulateMobile) {
+        return;
+    }
+    str::Builder uaJson;
+    uaJson.AppendChar('"');
+    for (int i = 0; i < userAgent.len; i++) {
+        char c = userAgent.s[i];
+        if (c == '"' || c == '\\') {
+            uaJson.AppendChar('\\');
+        }
+        uaJson.AppendChar(c);
+    }
+    uaJson.AppendChar('"');
+    // Spoof Chrome Client Hints so Google AI does not take the Edge font path.
+    TempStr uaParams = fmt(
+        "{\"userAgent\":%s,\"platform\":\"Windows\",\"acceptLanguage\":\"zh-CN,zh;q=0.9,en;q=0.8\","
+        "\"userAgentMetadata\":{"
+        "\"brands\":[{\"brand\":\"Google Chrome\",\"version\":\"147\"},"
+        "{\"brand\":\"Chromium\",\"version\":\"147\"},"
+        "{\"brand\":\"Not.A/Brand\",\"version\":\"24\"}],"
+        "\"fullVersionList\":[{\"brand\":\"Google Chrome\",\"version\":\"147.0.0.0\"},"
+        "{\"brand\":\"Chromium\",\"version\":\"147.0.0.0\"},"
+        "{\"brand\":\"Not.A/Brand\",\"version\":\"10.0.2.3\"}],"
+        "\"fullVersion\":\"147.0.0.0\","
+        "\"platform\":\"Windows\",\"platformVersion\":\"15.0.0\","
+        "\"architecture\":\"x86\",\"model\":\"\",\"mobile\":false,\"bitness\":\"64\","
+        "\"wow64\":false}}",
+        ToStrTemp(uaJson));
+    CallDevTools("Emulation.setUserAgentOverride", uaParams);
+}
+
 void WebviewWnd::OnBrowserMessage(Str msg) {
     log(msg);
 }
@@ -2765,7 +2806,7 @@ void WebviewWnd::OnJsNotify(Str) {}
 void WebviewWnd::RebuildBindScript() {}
 void WebviewWnd::OnProcessFailed(WebViewProcessFailure) {}
 void WebviewWnd::Navigate(Str) {}
-void WebviewWnd::Reload() {}
+void WebviewWnd::Reload(bool) {}
 void WebviewWnd::RegisterForwardingDropTarget() {}
 void WebviewWnd::RevokeForwardingDropTarget() {}
 void WebviewWnd::GoBack() {}
@@ -2802,4 +2843,5 @@ void WebviewWnd::OnShowWindow(WindowBase::ShowWindowEvent*) {}
 void WebviewWnd::UpdateWebviewSize() {}
 void WebviewWnd::CallDevTools(Str, Str) {}
 void WebviewWnd::ApplyMobileEmulation() {}
+void WebviewWnd::ApplyDesktopUserAgentOverride() {}
 #endif // !_MSC_VER

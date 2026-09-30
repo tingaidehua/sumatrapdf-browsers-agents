@@ -68,6 +68,9 @@ struct TreeModel {
     virtual bool IsChecked(TreeItem) = 0;
     virtual void SetUserData(TreeItem, uintptr_t) = 0;
     virtual uintptr_t GetUserData(TreeItem) = 0;
+    // Identity of an item that survives rebuilding the model (unique among siblings).
+    // Non-zero keys let TreeView::SetTreeModel reuse existing rows instead of re-creating them.
+    virtual i64 StableKey(TreeItem) { return 0; }
 };
 
 struct TreeItemVisitorData {

@@ -15,6 +15,8 @@ void SetToolbarButtonEnableState(MainWindow*, int cmdId, bool isEnabled);
 void SetToolbarButtonCheckedState(MainWindow*, int cmdId, bool isChecked);
 bool ShouldShowToolbar(MainWindow*);
 bool ShouldOverlayToolbar(MainWindow*);
+// width the toolbar needs to show all its buttons and the page box
+int ToolbarNaturalWidth(MainWindow*);
 void ShowOrHideToolbar(MainWindow*);
 void PositionOverlayToolbar(MainWindow*);
 void UpdateOverlayToolbarForMouse(MainWindow*);

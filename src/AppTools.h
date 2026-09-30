@@ -30,12 +30,16 @@ bool IsDllBuild();
 bool IsInstallerOrUninstallerExe();
 // Shared settings/library root: %OneDrive%\SumatraPDF when OneDrive is available.
 TempStr GetOneDriveAppDataDirTemp();
+// Machine-local heavy data (WebView2 profiles, cache, jobs) — never OneDrive.
+// %LOCALAPPDATA%\SumatraPDF when writable, else <appdata>\local.
+TempStr GetLocalSumatraDataDirTemp();
 
 void DeleteAppTools();
 
 void SetAppDataDir(Str dir);
 TempStr GetAppDataDirTemp();
 TempStr GetPathInAppDataDirTemp(Str fileName);
+TempStr GetPathInLocalSumatraDataDirTemp(Str fileName);
 
 void DetectTextEditors(Vec<TextEditor*>&);
 void CollectInverseSearchCommands(StrVec& out, Str cmdLine);

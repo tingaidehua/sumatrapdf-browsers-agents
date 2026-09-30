@@ -534,8 +534,9 @@ bool ScriptManagerWnd::Create(MainWindow* win) {
         editor->Create(wvArgs);
 
         TempStr editorHtml = path::JoinTemp(scriptsDir, StrL("manager\\editor.html"));
-        TempStr repoRoot = StrL("C:\\workspace\\sumatrapdf\\scripts\\webview");
-        if (!file::Exists(editorHtml) && file::Exists(path::JoinTemp(repoRoot, StrL("manager\\editor.html")))) {
+        TempStr repoRoot = FindRepoScriptsWebviewTemp();
+        if (!file::Exists(editorHtml) && repoRoot &&
+            file::Exists(path::JoinTemp(repoRoot, StrL("manager\\editor.html")))) {
             dir::CreateAll(path::GetDirTemp(editorHtml));
             file::Copy(editorHtml, path::JoinTemp(repoRoot, StrL("manager\\editor.html")), false);
             file::Copy(path::JoinTemp(scriptsDir, StrL("manifest.json")),
