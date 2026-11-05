@@ -36,6 +36,8 @@
 #include "Theme.h"
 #include "Translations.h"
 #include "WebPanel.h"
+#include "ChinesePalette.h"
+#include "Menu.h"
 #include "PdfTools.h"
 #include "ScriptManager.h"
 
@@ -844,18 +846,7 @@ enum {
 // one id per folder in the "添加标签" submenu; above the color swatch ids
 constexpr int kLibraryMenuTagFirst = 1000;
 
-// Pale Song-dynasty inspired row tints (flat, low chroma). Values are 0x00RRGGBB.
-struct LibraryBgSwatch {
-    const char* name;
-    u32 rgb;
-};
-
-static const LibraryBgSwatch gLibraryBgSwatches[] = {
-    {"月白", 0xD6ECF0}, {"青白", 0xC0EBD7}, {"天水碧", 0xD5EBED}, {"艾绿", 0xD5EFDF},
-    {"竹青", 0xE2EAD9}, {"水色", 0xDCE8E6}, {"藕荷", 0xF0E0E6}, {"藕色", 0xF5E6EA},
-    {"缃色", 0xF4ECD4},
-};
-
+// Color swatches live in ChinesePalette (shared with toolbar / AI icons).
 static HBITMAP CreateFlatColorSwatch(u32 rgb, int size) {
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -895,8 +886,10 @@ static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
     AppendMenuW(colorMenu, MF_STRING, kLibraryMenuColorNone, CWStrTemp(_TRA("无")));
     AppendMenuW(colorMenu, MF_SEPARATOR, 0, nullptr);
     int swatchSize = DpiScale(22);
-    for (int i = 0; i < dimof(gLibraryBgSwatches); i++) {
-        HBITMAP hbmp = CreateFlatColorSwatch(gLibraryBgSwatches[i].rgb, swatchSize);
+    int n = ChinesePaletteCount();
+    for (int i = 0; i < n; i++) {
+        const ChineseColorSwatch& sw = ChinesePaletteAt(i);
+        HBITMAP hbmp = CreateFlatColorSwatch(sw.rgb, swatchSize);
         if (hbmp) {
             bitmaps.Append(hbmp);
         }
@@ -905,10 +898,11 @@ static void AppendLibraryColorMenu(HMENU parent, Vec<HBITMAP>& bitmaps) {
         mii.fMask = MIIM_ID | MIIM_STRING | MIIM_BITMAP | MIIM_FTYPE;
         mii.fType = MFT_STRING;
         mii.wID = kLibraryMenuColorFirst + i;
-        mii.dwTypeData = (LPWSTR)CWStrTemp(gLibraryBgSwatches[i].name);
+        mii.dwTypeData = (LPWSTR)CWStrTemp(sw.name);
         mii.hbmpItem = hbmp;
         InsertMenuItemW(colorMenu, GetMenuItemCount(colorMenu), TRUE, &mii);
     }
+    LimitPopupMenuHeight(colorMenu);
     AppendMenuW(parent, MF_POPUP, (UINT_PTR)colorMenu, CWStrTemp(_TRA("背景颜色")));
 }
 
@@ -991,6 +985,7 @@ static void AppendCollectionRetagMenu(HMENU parent, i64 collectionId, Vec<i64>& 
     AppendMenuW(tagMenu, MF_SEPARATOR, 0, nullptr);
     AppendTagMenuLevel(tagMenu, cols, 0, 0, self, menuTagIds, &descendants);
     DeleteLibraryCollections(cols);
+    LimitPopupMenuHeight(tagMenu);
     AppendMenuW(parent, MF_POPUP, (UINT_PTR)tagMenu, CWStrTemp(_TRA("修改标签")));
 }
 
@@ -1005,6 +1000,7 @@ static void AppendLibraryTagMenu(HMENU parent, i64 bookId, Vec<i64>& menuTagIds)
         AppendTagMenuLevel(tagMenu, cols, 0, 0, bookTags, menuTagIds);
     }
     DeleteLibraryCollections(cols);
+    LimitPopupMenuHeight(tagMenu);
     AppendMenuW(parent, MF_POPUP, (UINT_PTR)tagMenu, CWStrTemp(_TRA("添加标签")));
 }
 
@@ -1408,8 +1404,8 @@ static void OnTreeContextMenu(ContextMenuEvent* ev) {
         } else if (item->kind == LibraryTreeKind::Collection) {
             changed = LibraryStoreSetCollectionBgColor(LibraryGetStore(), item->collectionId, 0);
         }
-    } else if (cmd >= kLibraryMenuColorFirst && cmd < kLibraryMenuColorFirst + dimof(gLibraryBgSwatches)) {
-        u32 rgb = gLibraryBgSwatches[cmd - kLibraryMenuColorFirst].rgb;
+    } else if (cmd >= kLibraryMenuColorFirst && cmd < kLibraryMenuColorFirst + ChinesePaletteCount()) {
+        u32 rgb = ChinesePaletteAt(cmd - kLibraryMenuColorFirst).rgb;
         if (item->kind == LibraryTreeKind::Book) {
             changed = LibraryStoreSetBookBgColor(LibraryGetStore(), item->bookId, rgb);
         } else if (item->kind == LibraryTreeKind::Collection) {
@@ -2562,7 +2558,9 @@ static LRESULT CALLBACK LibraryBoxWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 
 static VirtIconButton* HeaderButton(const char* svg, Str tooltip, const VirtMouseHandler& onClick) {
     auto* button = new VirtIconButton();
-    button->pixmap = GetCachedPixmapForSvg(Str(svg), DpiScale(16), DpiScale(16));
+    // Match AI/Web header icon size (~+1/5 vs old 16).
+    int sz = DpiScale(19);
+    button->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz, ChinesePaletteIconColor(4));
     int pad = DpiScale(2);
     button->padding = Insets{0, pad, 0, pad};
     button->onClick = onClick;
@@ -2640,7 +2638,7 @@ void CreateLibraryPanel(MainWindow* win) {
 
 void UpdateLibraryPanelIcons(MainWindow* win) {
     if (!win || !win->libraryAddButton) return;
-    win->libraryAddButton->pixmap = GetCachedPixmapForSvg(Str(gIconPlus), DpiScale(16), DpiScale(16));
+    win->libraryAddButton->pixmap = GetCachedPixmapForSvg(Str(gIconPlus), DpiScale(19), DpiScale(19), ChinesePaletteIconColor(4));
     if (win->hwndLibraryBox) HwndInvalidate(win->hwndLibraryBox);
 }
 

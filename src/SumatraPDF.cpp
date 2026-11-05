@@ -111,6 +111,7 @@
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
 #include "WebPanel.h"
+#include "DevInfo.h"
 #include "SelectionTranslate.h"
 #include "SelectionHandlers.h"
 #include "CommandPalette.h"
@@ -10958,6 +10959,10 @@ static LRESULT FrameOnCommand(MainWindow* win, HWND hwnd, UINT msg, WPARAM wp, L
         case CmdToggleWebSidebar:
             OnWebPanelToggle(win);
             ToolbarUpdateStateForWindow(win, false);
+            break;
+
+        case CmdShowDevInfo:
+            ShowDevInfoDialog(win);
             break;
 
         case CmdShowHome:

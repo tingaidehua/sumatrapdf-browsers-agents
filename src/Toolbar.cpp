@@ -43,6 +43,7 @@
 #include "FindBar.h"
 #include "Translations.h"
 #include "SvgIcons.h"
+#include "ChinesePalette.h"
 #include "Theme.h"
 #include "TextToSpeech.h"
 
@@ -59,34 +60,36 @@ struct ToolbarButtonInfo {
     Str toolTip;
     Str svgIcon; // custom SVG from settings
     bool isText = false;
+    int paletteIdx = -1; // ChinesePalette icon tint; -1 → TbTextColor()
 };
 
 static ToolbarButtonInfo gToolbarButtons[] = {
-    {gIconHome, CmdShowHome, _TRN("Home")},
-    {gIconLibrary, CmdToggleLibrary, _TRN("Library")},
-    {gIconBookmarks, CmdToggleBookmarks, _TRN("Bookmarks")},
-    {gIconChat, CmdToggleWebSidebar, _TRN("AI Sidebar")},
+    {gIconHome, CmdShowHome, _TRN("Home"), {}, false, 0},
+    {gIconLibrary, CmdToggleLibrary, _TRN("Library"), {}, false, 1},
+    {gIconBookmarks, CmdToggleBookmarks, _TRN("Bookmarks"), {}, false, 2},
+    {gIconChat, CmdToggleWebSidebar, _TRN("AI Sidebar"), {}, false, 3},
     {nullptr, 0, nullptr}, // separator
-    {gIconFileOpen, CmdOpenFile, _TRN("Open")},
-    {gIconPrint, CmdPrint, _TRN("Print")},
+    {gIconFileOpen, CmdOpenFile, _TRN("Open"), {}, false, 4},
+    {gIconPrint, CmdPrint, _TRN("Print"), {}, false, 5},
     {nullptr, 0, nullptr},          // separator
     {nullptr, PageInfoId, nullptr}, // text box for page number + show current page / no of pages
-    {gIconPagePrev, CmdGoToPrevPage, _TRN("Previous Page")},
-    {gIconPageNext, CmdGoToNextPage, _TRN("Next Page")},
+    {gIconPagePrev, CmdGoToPrevPage, _TRN("Previous Page"), {}, false, 6},
+    {gIconPageNext, CmdGoToNextPage, _TRN("Next Page"), {}, false, 7},
     {nullptr, 0, nullptr}, // separator
-    {gIconNavigateBack, CmdNavigateBack, _TRN("Back")},
-    {gIconNavigateForward, CmdNavigateForward, _TRN("Forward")},
+    {gIconNavigateBack, CmdNavigateBack, _TRN("Back"), {}, false, 8},
+    {gIconNavigateForward, CmdNavigateForward, _TRN("Forward"), {}, false, 9},
     {nullptr, 0, nullptr}, // separator
-    {gIconSpeak, CmdReadAloud, _TRN("Read Aloud")},
+    {gIconSpeak, CmdReadAloud, _TRN("Read Aloud"), {}, false, 10},
     {nullptr, 0, nullptr}, // separator
-    {gIconLayoutContinuous, CmdZoomFitWidthAndContinuous, _TRN("Fit Width and Show Pages Continuously")},
-    {gIconLayoutSinglePage, CmdZoomFitPageAndSinglePage, _TRN("Fit a Single Page")},
-    {gIconRotateLeft, CmdRotateLeft, _TRN("Rotate &Left")},
-    {gIconRotateRight, CmdRotateRight, _TRN("Rotate &Right")},
-    {gIconZoomOut, CmdZoomOut, _TRN("Zoom Out")},
-    {gIconZoomIn, CmdZoomIn, _TRN("Zoom In")},
+    {gIconLayoutContinuous, CmdZoomFitWidthAndContinuous, _TRN("Fit Width and Show Pages Continuously"), {}, false, 11},
+    {gIconLayoutSinglePage, CmdZoomFitPageAndSinglePage, _TRN("Fit a Single Page"), {}, false, 12},
+    {gIconRotateLeft, CmdRotateLeft, _TRN("Rotate &Left"), {}, false, 13},
+    {gIconRotateRight, CmdRotateRight, _TRN("Rotate &Right"), {}, false, 14},
+    {gIconZoomOut, CmdZoomOut, _TRN("Zoom Out"), {}, false, 15},
+    {gIconZoomIn, CmdZoomIn, _TRN("Zoom In"), {}, false, 16},
     {nullptr, 0, nullptr}, // separator
-    {gIconSearch, CmdFindFirst, _TRN("Find")},
+    {gIconSearch, CmdFindFirst, _TRN("Find"), {}, false, 17},
+    {gIconInfo, CmdShowDevInfo, _TRN("Developer Info"), {}, false, 18},
 };
 // unicode chars: https://www.compart.com/en/unicode/U+25BC
 
@@ -127,6 +130,13 @@ static Color TbDisabledColor() {
         return SysDisabledTextColor();
     }
     return ThemeWindowTextDisabledColor();
+}
+
+static Color ToolbarIconColor(const ToolbarButtonInfo& bi) {
+    if (bi.paletteIdx >= 0) {
+        return ChinesePaletteIconColor(bi.paletteIdx);
+    }
+    return TbTextColor();
 }
 
 static Color TbHoverColor() {
@@ -344,6 +354,8 @@ static bool IsCmdAvailable(MainWindow* win, int cmdId) {
             // CHM has its own (WebView2/IE) find bar even though NeedsFindUI()
             // is false for it; show the Search button so it's reachable
             return NeedsFindUI(win) || IsBrowserDocController(win->ctrl);
+        case CmdShowDevInfo:
+            return true;
         case CmdFindNext:
         case CmdFindPrev:
         case CmdFindToggleMatchCase:
@@ -492,8 +504,13 @@ static void SetToolbarButtonImageByIdx(MainWindow* win, int idx, const char* ico
     }
     ToolbarVirt* tb = win->toolbarVirt;
     int sz = tb ? tb->iconSize : DpiScale(gGlobalPrefs->toolbarSize);
-    Pixmap* px = GetCachedPixmapForSvg(icon, sz, sz, TbTextColor());
-    Pixmap* pxOff = GetCachedPixmapForSvg(icon, sz, sz, TbDisabledColor());
+    Color fg = ToolbarIconColor(GetToolbarButtonInfoByIdx(idx));
+    // Speak/pause swap keeps the same Chinese-palette tint as the Read Aloud button.
+    if (icon == gIconSpeak || icon == gIconPauseSpeaking) {
+        fg = ChinesePaletteIconColor(10);
+    }
+    Pixmap* px = GetCachedPixmapForSvg(icon, sz, sz, fg, TbBgColor());
+    Pixmap* pxOff = GetCachedPixmapForSvg(icon, sz, sz, TbDisabledColor(), TbBgColor());
     if (ib->pixmap == px && ib->pixmapDisabled == pxOff) {
         return;
     }
@@ -1047,7 +1064,6 @@ static void RefreshToolbarIcons(MainWindow* win) {
         return;
     }
     int sz = tb->iconSize;
-    Color fg = TbTextColor();
     Color dis = TbDisabledColor();
     for (int i = 0; i < len(tb->items); i++) {
         VirtCtrl* w = tb->items[i];
@@ -1061,6 +1077,7 @@ static void RefreshToolbarIcons(MainWindow* win) {
             continue;
         }
         Str svg = bi.svgIcon ? bi.svgIcon : Str(bi.icon);
+        Color fg = ToolbarIconColor(bi);
         ib->pixmap = GetCachedPixmapForSvg(svg, sz, sz, fg, TbBgColor());
         ib->pixmapDisabled = GetCachedPixmapForSvg(svg, sz, sz, dis, TbBgColor());
     }
@@ -1286,7 +1303,8 @@ static void BuildToolbarLayout(MainWindow* win) {
             ib->padding = {cyPad, iconPad, cyPad, iconPad};
             ib->hasDropdown = (bi.cmdId == CmdReadAloud);
             Str svg = bi.svgIcon ? bi.svgIcon : Str(bi.icon);
-            ib->pixmap = GetCachedPixmapForSvg(svg, tb->iconSize, tb->iconSize, fg, TbBgColor());
+            Color iconFg = ToolbarIconColor(bi);
+            ib->pixmap = GetCachedPixmapForSvg(svg, tb->iconSize, tb->iconSize, iconFg, TbBgColor());
             ib->pixmapDisabled = GetCachedPixmapForSvg(svg, tb->iconSize, tb->iconSize, dis, TbBgColor());
             w = ib;
         }

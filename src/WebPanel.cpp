@@ -29,7 +29,9 @@
 #include "Theme.h"
 #include "DarkMode_win.h"
 #include "SvgIcons.h"
+#include "ChinesePalette.h"
 #include "Translations.h"
+#include "Menu.h"
 #include "ImageReader.h"
 #include "AIChatCommon.h"
 #include "AIChatPanel.h"
@@ -47,6 +49,9 @@ namespace {
 
 constexpr int kDefaultCdpPort = 9224;      // Browser-AIChat (NotebookLM / Playwright)
 constexpr int kLibraryCdpPort = 9225;      // Browser-Library (center Web)
+// Keep only this many live WebView2 instances; others hibernate (metadata kept, cold reopen).
+constexpr int kMaxLiveWebPanelViews = 8;
+constexpr int kMaxLiveWebBrowserViews = 12;
 // Match anything-copilot: iPhone Safari UA + narrow viewport (no hybrid desktop)
 static const char* kMobileUserAgent =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
@@ -577,8 +582,8 @@ TempStr FaviconCachePathTemp(Str host) {
 }
 
 // browser-style favicon from disk cache only (never network on UI thread).
-// Sized to fit the sidebar header (same band as Library / ToC labels).
-constexpr int kPinIconPx = 14;
+// Sized to fit the sidebar header (Library / ToC / AI / Web). ~+1/5 vs the old 14px.
+constexpr int kPinIconPx = 17;
 
 Pixmap* LoadFaviconPixmap(Str url) {
     int sz = DpiScale(kPinIconPx);
@@ -664,14 +669,30 @@ void ScheduleFaviconPrefetch(MainWindow* win) {
         return;
     }
     auto* urls = new Vec<Str>();
-    for (WebBookmark& b : gBookmarks) {
-        if (b.pinned && b.url) {
-            TempStr host = HostFromUrlTemp(b.url);
-            TempStr cachePath = host ? FaviconCachePathTemp(host) : TempStr{};
-            if (cachePath && file::Exists(cachePath)) {
-                continue;
+    auto appendIfMissing = [&](Str url) {
+        if (!url) {
+            return;
+        }
+        TempStr host = HostFromUrlTemp(url);
+        TempStr cachePath = host ? FaviconCachePathTemp(host) : TempStr{};
+        if (cachePath && file::Exists(cachePath)) {
+            return;
+        }
+        for (Str& existing : *urls) {
+            if (str::EqI(existing, url)) {
+                return;
             }
-            urls->Append(str::Dup(b.url));
+        }
+        urls->Append(str::Dup(url));
+    };
+    for (WebBookmark& b : gBookmarks) {
+        if (b.pinned) {
+            appendIfMissing(b.url);
+        }
+    }
+    for (WebPanelTab& t : win->webPanelTabs) {
+        if (t.pinned) {
+            appendIfMissing(t.url);
         }
     }
     if (len(*urls) == 0) {
@@ -687,6 +708,7 @@ void DeferredEnsureWebPanelWebView(MainWindow* win) {
         return;
     }
     EnsureWebPanelWebView(win);
+    RebuildPinStrip(win);
     ScheduleUiUpdate(win);
     ScheduleFaviconPrefetch(win);
 }
@@ -995,6 +1017,9 @@ void SaveWebPanelTabs(MainWindow* win) {
         if (t.titleLocked) {
             sb.Append(StrL(", \"titleLocked\": true"));
         }
+        if (t.pinned) {
+            sb.Append(StrL(", \"pinned\": true"));
+        }
         sb.Append(StrL("}"));
     }
     sb.Append(StrL("\n  ]\n}\n"));
@@ -1051,6 +1076,8 @@ void LoadWebPanelTabs(MainWindow* win) {
             str::ReplaceWithCopy(&s->cur.title, v->value);
         } else if (str::EndsWithI(p, StrL("/titleLocked"))) {
             s->cur.titleLocked = v->value && (str::EqI(v->value, StrL("true")) || str::Eq(v->value, StrL("1")));
+        } else if (str::EndsWithI(p, StrL("/pinned"))) {
+            s->cur.pinned = v->value && (str::EqI(v->value, StrL("true")) || str::Eq(v->value, StrL("1")));
         }
     };
     json::Parse(data, MkFunc1<St, json::Value*>(onVal, &st));
@@ -1585,18 +1612,84 @@ void WriteBridgeJson(MainWindow* win) {
     }
     TempStr url = win && win->webPanelCurrentUrl ? win->webPanelCurrentUrl : gLastUrl;
     TempStr profile = WebViewProfileDirTemp();
-    int port = win && win->webPanelCdpPort > 0 ? win->webPanelCdpPort : gCdpPort;
+    TempStr webProfile = WebViewBrowserProfileDirTemp();
+    int aiPort = win && win->webPanelCdpPort > 0 ? win->webPanelCdpPort : gCdpPort;
+    if (aiPort <= 0) {
+        aiPort = kDefaultCdpPort;
+    }
+    int webPort = kLibraryCdpPort;
     TempStr json = fmt(
         "{\n"
         "  \"cdpPort\": %d,\n"
         "  \"cdpEndpoint\": \"http://127.0.0.1:%d\",\n"
+        "  \"aiCdpPort\": %d,\n"
+        "  \"aiCdpEndpoint\": \"http://127.0.0.1:%d\",\n"
+        "  \"aiCdpJsonVersion\": \"http://127.0.0.1:%d/json/version\",\n"
+        "  \"aiCdpJsonList\": \"http://127.0.0.1:%d/json/list\",\n"
+        "  \"webCdpPort\": %d,\n"
+        "  \"webCdpEndpoint\": \"http://127.0.0.1:%d\",\n"
+        "  \"webCdpJsonVersion\": \"http://127.0.0.1:%d/json/version\",\n"
+        "  \"webCdpJsonList\": \"http://127.0.0.1:%d/json/list\",\n"
+        "  \"controlPipe\": \"\\\\\\\\.\\\\pipe\\\\sumatrapdf-ai\",\n"
         "  \"userDataDir\": %s,\n"
+        "  \"webUserDataDir\": %s,\n"
         "  \"url\": %s,\n"
         "  \"pdfPath\": %s,\n"
         "  \"fileName\": %s\n"
         "}\n",
-        port, port, EscapeJsonTemp(profile), EscapeJsonTemp(url), EscapeJsonTemp(pdfPath), EscapeJsonTemp(fileName));
+        aiPort, aiPort, aiPort, aiPort, aiPort, aiPort, webPort, webPort, webPort, webPort,
+        EscapeJsonTemp(profile), EscapeJsonTemp(webProfile), EscapeJsonTemp(url), EscapeJsonTemp(pdfPath),
+        EscapeJsonTemp(fileName));
     file::WriteFile(BridgePathCanonicalTemp(), json);
+}
+
+// Drop cold WebView2 instances so metadata (id/url/title/pinned) stays but RAM is freed.
+// Keep `keepIdx` (and pinned tabs) warm. Call before creating another live view.
+static void HibernateWebViews(Vec<WebPanelTab>& tabs, int keepIdx, int maxLive) {
+    if (maxLive < 1) {
+        maxLive = 1;
+    }
+    auto countLive = [&]() -> int {
+        int n = 0;
+        for (WebPanelTab& t : tabs) {
+            if (t.wv) {
+                n++;
+            }
+        }
+        return n;
+    };
+    while (countLive() > maxLive) {
+        int victim = -1;
+        ULONGLONG oldest = (ULONGLONG)-1;
+        for (int i = 0; i < len(tabs); i++) {
+            if (i == keepIdx || !tabs[i].wv || tabs[i].pinned) {
+                continue;
+            }
+            ULONGLONG stamp = tabs[i].lastActiveMs;
+            if (stamp < oldest) {
+                oldest = stamp;
+                victim = i;
+            }
+        }
+        if (victim < 0) {
+            // Only pinned/live remain — allow overshoot rather than killing pins.
+            break;
+        }
+        WebPanelTab& t = tabs[victim];
+        if (t.wv) {
+            TempStr url = t.wv->GetSourceTemp();
+            if (url && url.len > 0) {
+                str::ReplaceWithCopy(&t.url, url);
+            }
+            TempStr title = t.wv->GetDocumentTitleTemp();
+            if (title && title.len > 0 && !t.titleLocked) {
+                str::ReplaceWithCopy(&t.title, title);
+            }
+            logf("WebTab hibernate idx=%d url='%s' (live was %d)\n", victim, t.url ? t.url : "", countLive());
+            delete t.wv;
+            t.wv = nullptr;
+        }
+    }
 }
 
 void LayoutWebPanelBox(MainWindow* win) {
@@ -1692,7 +1785,8 @@ WebviewWnd* CreateWebPanelTabWebView(MainWindow* win, Str url) {
     webView->mobileDeviceHeight = 0;
     webView->mobileDeviceScale = 1.0f;
     webView->userAgent = str::Dup(kMobileUserAgent);
-    webView->dedicatedBrowserArgs = str::Dup(fmt("--remote-debugging-port=%d", port));
+    webView->dedicatedBrowserArgs =
+        str::Dup(fmt("--remote-debugging-port=%d --remote-allow-origins=*", port));
     webView->enableBrowserExtensions = true;
     webView->browserExtensionsDir = str::Dup(BrowserExtensionsInstalledDirTemp());
     webView->allowClipboardRead = true;
@@ -1718,12 +1812,14 @@ void ActivateWebPanelTabByIndex(MainWindow* win, int idx, bool rememberPdf) {
     }
     WebPanelTab& t = win->webPanelTabs[idx];
     if (!t.wv && t.url) {
+        HibernateWebViews(win->webPanelTabs, idx, kMaxLiveWebPanelViews - 1);
         t.wv = CreateWebPanelTabWebView(win, t.url);
         if (!t.wv) {
             return;
         }
     }
     win->webPanelActiveTab = idx;
+    t.lastActiveMs = GetTickCount64();
     if (t.url) {
         str::ReplaceWithCopy(&win->webPanelCurrentUrl, t.url);
         str::ReplaceWithCopy(&gLastUrl, t.url);
@@ -1733,6 +1829,7 @@ void ActivateWebPanelTabByIndex(MainWindow* win, int idx, bool rememberPdf) {
     ShowActiveWebPanelTab(win);
     SaveWebPanelTabs(win);
     WriteBridgeJson(win);
+    RebuildPinStrip(win);
     RelayoutWebPanel(win);
     if (rememberPdf) {
         RememberPdfActiveTab(win);
@@ -1751,6 +1848,7 @@ void CreateNewWebPanelTab(MainWindow* win, Str url, Str title, Str forcedId) {
             return;
         }
     }
+    HibernateWebViews(win->webPanelTabs, -1, kMaxLiveWebPanelViews - 1);
     WebviewWnd* wv = CreateWebPanelTabWebView(win, url);
     if (!wv) {
         return;
@@ -1759,6 +1857,7 @@ void CreateNewWebPanelTab(MainWindow* win, Str url, Str title, Str forcedId) {
     tab.id = str::Dup(forcedId && forcedId.len > 0 ? forcedId : NewWebPanelTabIdTemp());
     tab.url = str::Dup(url);
     tab.title = str::Dup(title && title.len > 0 ? title : TitleFromUrlTemp(url));
+    tab.lastActiveMs = GetTickCount64();
     tab.wv = wv;
     win->webPanelTabs.Append(tab);
     ActivateWebPanelTabByIndex(win, len(win->webPanelTabs) - 1, true);
@@ -1788,6 +1887,7 @@ void CloseWebPanelTabAt(MainWindow* win, int idx) {
     }
     SaveWebPanelTabs(win);
     ShowActiveWebPanelTab(win);
+    RebuildPinStrip(win);
     RelayoutWebPanel(win);
 }
 
@@ -1808,6 +1908,7 @@ void CloseAllWebPanelTabs(MainWindow* win) {
     win->webPanelWebViewReady = false;
     SaveWebPanelTabs(win);
     ShowActiveWebPanelTab(win);
+    RebuildPinStrip(win);
     RelayoutWebPanel(win);
 }
 
@@ -2120,20 +2221,18 @@ struct VirtHScrollStrip : VirtCtrl {
     }
 };
 
-// Favicon pin that scales the image to the header and shows a hover ✕ to unpin/delete.
+// Favicon pin shortcut in the AI header (click activates; unpin via the Tab list pin).
 struct VirtPinBtn : VirtCtrl {
     Pixmap* pixmap = nullptr; // owned if ownsPixmap
     bool ownsPixmap = false;
     MainWindow* win = nullptr;
-    int bookmarkIdx = -1;
-    bool hoverClose = false;
+    int tabIdx = -1;
     bool selected = false;
 
     VirtPinBtn() {
         cursor = CursorId::Hand;
         onMouseEnter = MkMethod0<VirtPinBtn, &VirtPinBtn::OnEnter>(this);
         onMouseLeave = MkMethod0<VirtPinBtn, &VirtPinBtn::OnLeave>(this);
-        onMouseMove = MkMethod1<VirtPinBtn, VirtMouseEvent*, &VirtPinBtn::OnMove>(this);
         onClick = MkMethod1<VirtPinBtn, VirtMouseEvent*, &VirtPinBtn::OnPinClick>(this);
     }
 
@@ -2149,11 +2248,6 @@ struct VirtPinBtn : VirtCtrl {
         return {sz, sz};
     }
 
-    Rect CloseRectLocal() const {
-        int c = DpiScale(10);
-        return {bounds.dx - c, 0, c, c};
-    }
-
     void Paint(VirtPaintCtx& ctx) override {
         if (selected) {
             ctx.gfx->FillRect(ctx.bounds, MkGray(0xd0));
@@ -2165,46 +2259,20 @@ struct VirtPinBtn : VirtCtrl {
         if (pixmap) {
             ctx.gfx->DrawPixmap(pixmap, dst);
         }
-        if (HasFlag(vwfHovered)) {
-            Rect cr = CloseRectLocal();
-            cr.Offset(ctx.bounds.x, ctx.bounds.y);
-            Color circle = MkRgba(0xc0, 0x40, 0x40, 0xff);
-            ctx.gfx->FillEllipse(cr, circle, 230);
-            Color xcol = MkRgba(0xff, 0xff, 0xff, 0xff);
-            int pad = cr.dx / 3;
-            ctx.gfx->DrawLineAA({cr.x + pad, cr.y + pad}, {cr.x + cr.dx - pad, cr.y + cr.dy - pad}, xcol, 1.5f);
-            ctx.gfx->DrawLineAA({cr.x + cr.dx - pad, cr.y + pad}, {cr.x + pad, cr.y + cr.dy - pad}, xcol, 1.5f);
-        }
     }
 
     void OnEnter() {
         Invalidate();
     }
     void OnLeave() {
-        hoverClose = false;
         Invalidate();
-    }
-    void OnMove(VirtMouseEvent* ev) {
-        if (!ev) {
-            return;
-        }
-        bool onClose = CloseRectLocal().Contains(ev->pt);
-        if (onClose != hoverClose) {
-            hoverClose = onClose;
-            Invalidate();
-        }
     }
     void OnPinClick(VirtMouseEvent* ev) {
         if (!ev || !win) {
             return;
         }
-        if (CloseRectLocal().Contains(ev->pt)) {
-            DeleteBookmarkAt(win, bookmarkIdx);
-            ev->didHandle = true;
-            return;
-        }
-        if (bookmarkIdx >= 0 && bookmarkIdx < len(gBookmarks)) {
-            ActivateWebPanelTab(win, gBookmarks[bookmarkIdx].url);
+        if (tabIdx >= 0 && tabIdx < len(win->webPanelTabs)) {
+            ActivateWebPanelTabByIndex(win, tabIdx, true);
         }
         ev->didHandle = true;
     }
@@ -2221,8 +2289,62 @@ void OnPinnedBookmarkClick(PinClickCtx* ctx) {
 }
 
 void RebuildPinStrip(MainWindow* win) {
-    // Pin favicon strip removed — bookmarks open from the menu only.
-    (void)win;
+    if (!win || !win->webPanelPinStrip) {
+        return;
+    }
+    auto* strip = (VirtHScrollStrip*)win->webPanelPinStrip;
+    // Drop children via RemoveChild so VirtRoot clears hovered/pressed pointers.
+    while (len(strip->children) > 0) {
+        VirtCtrl* c = strip->children[0];
+        strip->RemoveChild(c, false);
+        delete c;
+    }
+    FreePinClickCtxs();
+
+    int nPinned = 0;
+    for (int i = 0; i < len(win->webPanelTabs); i++) {
+        WebPanelTab& t = win->webPanelTabs[i];
+        if (!t.pinned) {
+            continue;
+        }
+        nPinned++;
+        auto* btn = new VirtPinBtn();
+        btn->win = win;
+        btn->tabIdx = i;
+        btn->selected = (i == win->webPanelActiveTab);
+        TempStr host = HostFromUrlTemp(t.url);
+        TempStr cachePath = host ? FaviconCachePathTemp(host) : TempStr{};
+        bool fromFile = cachePath && file::Exists(cachePath);
+        btn->pixmap = LoadFaviconPixmap(t.url);
+        btn->ownsPixmap = fromFile && btn->pixmap != nullptr;
+        // If LoadFaviconPixmap fell back to the cached SVG, do not free it.
+        if (btn->ownsPixmap) {
+            int sz = DpiScale(kPinIconPx);
+            Pixmap* fallback = GetCachedPixmapForSvg(gIconChat, sz, sz);
+            if (btn->pixmap == fallback) {
+                btn->ownsPixmap = false;
+            }
+        }
+        Str tip = t.title ? t.title : TitleFromUrlTemp(t.url);
+        btn->SetTooltip(tip);
+        strip->AddChild(btn);
+    }
+
+    if (win->webPanelPinSep) {
+        win->webPanelPinSep->SetVisibility(nPinned > 0 ? Visibility::Visible : Visibility::Collapse);
+    }
+}
+
+static POINT PointBelowPanelHeader(MainWindow* win, HBox* header, HWND hwndBox) {
+    POINT pt{};
+    if (win && header && hwndBox) {
+        Rect hb = header->lastBounds;
+        pt = {hb.x, hb.Bottom()};
+        ClientToScreen(hwndBox, &pt);
+        return pt;
+    }
+    GetCursorPos(&pt);
+    return pt;
 }
 
 void ShowBookmarksMenu(MainWindow* win) {
@@ -2242,9 +2364,10 @@ void ShowBookmarksMenu(MainWindow* win) {
     AppendMenuW(menu, MF_STRING, kAddCurrent, CWStrTemp(_TRA("添加当前页为书签")));
     AppendMenuW(menu, MF_STRING, kAddClipboard, CWStrTemp(_TRA("从剪贴板添加 URL")));
 
-    POINT pt;
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndWebPanelBox, nullptr);
+    LimitPopupMenuHeight(menu);
+    POINT pt = PointBelowPanelHeader(win, win->webPanelHeader, win->hwndWebPanelBox);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN, pt.x, pt.y, 0,
+                             win->hwndWebPanelBox, nullptr);
     DestroyMenu(menu);
     if (cmd == 0) {
         return;
@@ -2284,16 +2407,21 @@ void OnBookmarksButton(MainWindow* win) {
 }
 
 // Custom tabs popup: left-click activates, middle-click closes (no ✕ — matches browser middle-click close).
+// Pin icon on the left of each row toggles header favicon shortcuts.
 struct TabsPopupState {
     MainWindow* win = nullptr;
     HWND hwnd = nullptr;
     int hover = -100; // -2=close-all, >=0=tab index
     int rowH = 0;
     int padX = 0;
+    int pinColW = 0; // left pin column width
     int nTabs = 0;
     int statsH = 0;
     int closeAllY0 = 0;
     int tabsY0 = 0;
+    int scrollY = 0;       // scroll offset within tab list
+    int tabsViewH = 0;     // visible height of tab list
+    int tabsContentH = 0;  // total height of all tab rows
     bool hasCloseAll = false;
     // closing a tab can hand focus to a WebView a moment later; don't let that dismiss the
     // reopened popup (middle-click closes several tabs in a row)
@@ -2303,6 +2431,7 @@ struct TabsPopupState {
     Str closeAllLabel;
     Vec<Str> titles;
     Vec<bool> activeFlags;
+    Vec<bool> pinnedFlags;
 };
 
 static TabsPopupState* gTabsPopup = nullptr;
@@ -2334,14 +2463,55 @@ static int TabsPopupHitRow(TabsPopupState* st, int y) {
     if (st->hasCloseAll && y >= st->closeAllY0 && y < st->closeAllY0 + st->rowH) {
         return -2;
     }
-    if (y < st->tabsY0) {
+    if (y < st->tabsY0 || y >= st->tabsY0 + st->tabsViewH) {
         return -100;
     }
-    int idx = (y - st->tabsY0) / st->rowH;
+    if (st->nTabs <= 0) {
+        return -100;
+    }
+    int idx = (y - st->tabsY0 + st->scrollY) / st->rowH;
     if (idx < 0 || idx >= st->nTabs) {
         return -100;
     }
     return idx;
+}
+
+static void TabsPopupClampScroll(TabsPopupState* st) {
+    if (!st) {
+        return;
+    }
+    int maxScroll = std::max(0, st->tabsContentH - st->tabsViewH);
+    if (st->scrollY < 0) {
+        st->scrollY = 0;
+    } else if (st->scrollY > maxScroll) {
+        st->scrollY = maxScroll;
+    }
+}
+
+static int PopupMaxHeightForMonitor(HWND anchor) {
+    HMONITOR mon = MonitorFromWindow(anchor ? anchor : GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+    MONITORINFO miMon{};
+    miMon.cbSize = sizeof(miMon);
+    int workH = DpiScale(360);
+    if (GetMonitorInfoW(mon, &miMon)) {
+        workH = miMon.rcWork.bottom - miMon.rcWork.top;
+    }
+    return std::max(DpiScale(280), workH * 45 / 100);
+}
+
+static bool TabsPopupHitPin(TabsPopupState* st, int x, int hit) {
+    return st && hit >= 0 && x >= 0 && x < st->pinColW;
+}
+
+static void ToggleWebPanelTabPinned(MainWindow* win, int idx) {
+    if (!win || idx < 0 || idx >= len(win->webPanelTabs)) {
+        return;
+    }
+    win->webPanelTabs[idx].pinned = !win->webPanelTabs[idx].pinned;
+    SaveWebPanelTabs(win);
+    RebuildPinStrip(win);
+    RelayoutWebPanel(win);
+    ScheduleFaviconPrefetch(win);
 }
 
 static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs);
@@ -2374,6 +2544,24 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             }
             return 0;
         }
+        case WM_MOUSEWHEEL: {
+            if (st->tabsContentH <= st->tabsViewH) {
+                return 0;
+            }
+            int delta = GET_WHEEL_DELTA_WPARAM(wp);
+            int notches = delta / WHEEL_DELTA;
+            if (notches == 0) {
+                notches = delta > 0 ? 1 : -1;
+            }
+            st->scrollY -= notches * st->rowH * 3;
+            TabsPopupClampScroll(st);
+            POINT cur;
+            GetCursorPos(&cur);
+            ScreenToClient(hwnd, &cur);
+            st->hover = TabsPopupHitRow(st, cur.y);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         case WM_LBUTTONUP: {
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             int hit = TabsPopupHitRow(st, pt.y);
@@ -2381,6 +2569,16 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             if (hit == -2) {
                 DestroyTabsPopup();
                 CloseAllWebPanelTabs(win);
+                return 0;
+            }
+            if (hit >= 0 && TabsPopupHitPin(st, pt.x, hit)) {
+                RECT wr{};
+                GetWindowRect(hwnd, &wr);
+                DestroyTabsPopup();
+                ToggleWebPanelTabPinned(win, hit);
+                if (IsMainWindowValid(win)) {
+                    ShowTabsMenuAt(win, POINT{wr.left, wr.top}, 600);
+                }
                 return 0;
             }
             if (hit >= 0) {
@@ -2433,21 +2631,47 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             HFONT font = pfont ? pfont->GetHFont() : nullptr;
             HFONT oldFont = font ? (HFONT)SelectObject(hdc, font) : nullptr;
 
-            auto drawTextRow = [&](int y, Str text, Color col, bool highlight, bool activeDot) {
+            int pinIcon = DpiScale(kPinIconPx);
+            // Unpinned: muted outline. Pinned: solid sky blue so it reads at a glance.
+            constexpr Color kPinSkyBlue = MkRgb(0x3B, 0xC4, 0xF0);
+            Pixmap* pinMuted = GetCachedPixmapForSvg(gIconPin, pinIcon, pinIcon, muted, bg);
+            Pixmap* pinOn = GetCachedPixmapForSvg(gIconPinFilled, pinIcon, pinIcon, kPinSkyBlue, bg);
+
+            auto drawTextRow = [&](int y, Str text, Color col, bool highlight, bool activeDot, int pinMode) {
+                // pinMode: -1=none, 0=unpinned, 1=pinned
                 RECT row{0, y, rc.right, y + st->rowH};
                 if (highlight) {
                     HBRUSH brHot = CreateSolidBrush(hot);
                     FillRect(hdc, &row, brHot);
                     DeleteObject(brHot);
                 }
-                SetTextColor(hdc, col);
                 int left = st->padX;
+                if (pinMode >= 0) {
+                    Pixmap* pinPx = pinMode > 0 ? pinOn : pinMuted;
+                    if (pinPx) {
+                        int px = (st->pinColW - pinIcon) / 2;
+                        int py = y + (st->rowH - pinIcon) / 2;
+                        BlitPixmapAlpha(pinPx, hdc, {px, py, pinIcon, pinIcon});
+                    }
+                    left = st->pinColW;
+                }
+                SetTextColor(hdc, col);
                 if (activeDot) {
-                    const WCHAR* dot = L"\u25CF ";
-                    TextOutW(hdc, left, y + (st->rowH - 16) / 2, dot, 2);
-                    SIZE sz{};
-                    GetTextExtentPoint32W(hdc, dot, 2, &sz);
-                    left += sz.cx;
+                    // Green disc, vertically centered with the pin and title.
+                    constexpr Color kActiveDot = MkRgb(0x22, 0xC5, 0x5E);
+                    int dot = DpiScale(7);
+                    int dx = left + DpiScale(2);
+                    int dy = y + (st->rowH - dot) / 2;
+                    HBRUSH br = CreateSolidBrush(kActiveDot);
+                    HPEN penDot = CreatePen(PS_SOLID, 1, kActiveDot);
+                    HGDIOBJ oldBr = SelectObject(hdc, br);
+                    HGDIOBJ oldPn = SelectObject(hdc, penDot);
+                    Ellipse(hdc, dx, dy, dx + dot, dy + dot);
+                    SelectObject(hdc, oldBr);
+                    SelectObject(hdc, oldPn);
+                    DeleteObject(br);
+                    DeleteObject(penDot);
+                    left += dot + DpiScale(6);
                 }
                 RECT textRc{left, y, rc.right - st->padX, y + st->rowH};
                 TempWStr wText = ToWStrTemp(text);
@@ -2455,7 +2679,7 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             };
 
-            drawTextRow(0, st->stats, muted, false, false);
+            drawTextRow(0, st->stats, muted, false, false, -1);
             HPEN pen = CreatePen(PS_SOLID, 1, edge);
             HPEN oldPen = (HPEN)SelectObject(hdc, pen);
             int sepY = st->statsH;
@@ -2463,19 +2687,33 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             LineTo(hdc, rc.right - st->padX, sepY);
 
             if (st->hasCloseAll) {
-                drawTextRow(st->closeAllY0, st->closeAllLabel, fg, st->hover == -2, false);
+                drawTextRow(st->closeAllY0, st->closeAllLabel, fg, st->hover == -2, false, -1);
                 int sep2 = st->closeAllY0 + st->rowH;
                 MoveToEx(hdc, st->padX, sep2, nullptr);
                 LineTo(hdc, rc.right - st->padX, sep2);
             }
 
+            // Clip the scrollable tab list so rows don't paint over the header.
+            int save = SaveDC(hdc);
+            IntersectClipRect(hdc, 0, st->tabsY0, rc.right, st->tabsY0 + st->tabsViewH);
             if (st->nTabs == 0) {
-                drawTextRow(st->tabsY0, st->emptyHint, muted, false, false);
+                drawTextRow(st->tabsY0, st->emptyHint, muted, false, false, -1);
             } else {
-                for (int i = 0; i < st->nTabs; i++) {
-                    drawTextRow(st->tabsY0 + i * st->rowH, st->titles[i], fg, st->hover == i, st->activeFlags[i]);
+                int first = st->scrollY / st->rowH;
+                int last = (st->scrollY + st->tabsViewH) / st->rowH;
+                if (first < 0) {
+                    first = 0;
+                }
+                if (last >= st->nTabs) {
+                    last = st->nTabs - 1;
+                }
+                for (int i = first; i <= last; i++) {
+                    bool pinned = i < len(st->pinnedFlags) && st->pinnedFlags[i];
+                    int y = st->tabsY0 + i * st->rowH - st->scrollY;
+                    drawTextRow(y, st->titles[i], fg, st->hover == i, st->activeFlags[i], pinned ? 1 : 0);
                 }
             }
+            RestoreDC(hdc, save);
 
             SelectObject(hdc, oldPen);
             DeleteObject(pen);
@@ -2496,8 +2734,9 @@ static LRESULT CALLBACK TabsPopupWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 }
 
 void ShowTabsMenu(MainWindow* win) {
-    POINT pt;
-    GetCursorPos(&pt);
+    // Anchor below the AI header so the popup never covers the title-bar icons.
+    POINT pt = PointBelowPanelHeader(win, win ? win->webPanelHeader : nullptr,
+                                     win ? win->hwndWebPanelBox : nullptr);
     ShowTabsMenuAt(win, pt, 0);
 }
 
@@ -2530,6 +2769,7 @@ static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs) {
     st->hasCloseAll = st->nTabs > 0;
     st->rowH = DpiScale(26);
     st->padX = DpiScale(10);
+    st->pinColW = DpiScale(26);
     st->statsH = st->rowH;
     st->closeAllY0 = st->statsH + 1;
     st->tabsY0 = st->hasCloseAll ? (st->closeAllY0 + st->rowH + 1) : (st->statsH + 1);
@@ -2542,6 +2782,7 @@ static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs) {
                         : (t.title ? t.title : TitleFromUrlTemp(t.url));
         st->titles.Append(str::Dup(shown));
         st->activeFlags.Append(i == win->webPanelActiveTab);
+        st->pinnedFlags.Append(t.pinned);
     }
 
     if (!gTabsPopupAtom) {
@@ -2554,8 +2795,17 @@ static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs) {
         gTabsPopupAtom = RegisterClassW(&wc);
     }
 
-    int height = st->statsH + 1 + (st->hasCloseAll ? st->rowH + 1 : 0) +
-                 (st->nTabs > 0 ? st->nTabs * st->rowH : st->rowH) + DpiScale(4);
+    int heightHeader = st->statsH + 1 + (st->hasCloseAll ? st->rowH + 1 : 0);
+    st->tabsContentH = (st->nTabs > 0 ? st->nTabs * st->rowH : st->rowH);
+    int maxPopupH = PopupMaxHeightForMonitor(win->hwndWebPanelBox);
+    int maxTabsView = maxPopupH - heightHeader - DpiScale(4);
+    int minTabsView = st->rowH * 4;
+    if (maxTabsView < minTabsView) {
+        maxTabsView = minTabsView;
+    }
+    st->tabsViewH = std::min(st->tabsContentH, maxTabsView);
+    st->scrollY = 0;
+    int height = heightHeader + st->tabsViewH + DpiScale(4);
     int width = DpiScale(360);
     HDC hdcScreen = GetDC(nullptr);
     if (hdcScreen) {
@@ -2574,14 +2824,14 @@ static void ShowTabsMenuAt(MainWindow* win, POINT pos, ULONGLONG keepOpenMs) {
         for (Str& title : st->titles) {
             TempWStr wTitle = ToWStrTemp(title);
             GetTextExtentPoint32W(hdcScreen, wTitle.s, wTitle.len, &sz);
-            width = std::max(width, (int)sz.cx + st->padX * 2 + DpiScale(24));
+            width = std::max(width, (int)sz.cx + st->pinColW + st->padX + DpiScale(24));
         }
         if (old) {
             SelectObject(hdcScreen, old);
         }
         ReleaseDC(nullptr, hdcScreen);
     }
-    width = std::min(width, DpiScale(560));
+    width = std::min(width, DpiScale(640));
 
     HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"SUMATRA_WEBPANEL_TABS_MENU", L"",
                                 WS_POPUP | WS_BORDER, pos.x, pos.y, width, height, win->hwndFrame, nullptr,
@@ -3053,9 +3303,10 @@ void ShowBrowserExtensionsMenu(MainWindow* win, Str browserProfile) {
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kManageId, CWStrTemp(_TRA("管理扩展程序")));
 
-    POINT pt{};
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    LimitPopupMenuHeight(menu);
+    POINT pt = PointBelowPanelHeader(win, win->webPanelHeader, win->hwndWebPanelBox);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN, pt.x, pt.y, 0, win->hwndFrame,
+                             nullptr);
     DestroyMenu(menu);
 
     if (cmd == (int)kManageId) {
@@ -3131,6 +3382,7 @@ bool OnWebNavStarting(void* ctx, Str url, bool newWindow) {
     if (!IsMainWindowValid(win)) {
         return true;
     }
+    logf("WebPanel nav start url='%s' newWindow=%d t=%llu\n", url ? url : "", (int)newWindow, GetTickCount64());
     if (newWindow && url) {
         // AI panel only: popup / target=_blank → new AI tab.
         CreateNewWebPanelTab(win, url, TitleFromUrlTemp(url));
@@ -3146,6 +3398,7 @@ bool OnWebBrowserNavStarting(void* ctx, Str url, bool newWindow) {
     if (!IsMainWindowValid(win)) {
         return true;
     }
+    logf("WebBrowser nav start url='%s' newWindow=%d t=%llu\n", url ? url : "", (int)newWindow, GetTickCount64());
     if (newWindow && url) {
         if (str::EqI(url, StrL("about:blank")) || str::StartsWithI(url, StrL("about:blank?"))) {
             return false;
@@ -3166,7 +3419,11 @@ bool OnWebBrowserNavStarting(void* ctx, Str url, bool newWindow) {
 
 void OnWebNavCompleted(void* ctx, Str url, bool success) {
     auto* win = (MainWindow*)ctx;
-    if (!IsMainWindowValid(win) || !success) {
+    if (!IsMainWindowValid(win)) {
+        return;
+    }
+    logf("WebPanel nav done ok=%d url='%s' t=%llu\n", (int)success, url ? url : "", GetTickCount64());
+    if (!success) {
         return;
     }
     WebviewWnd* wv = win->webPanelWebView;
@@ -3232,6 +3489,11 @@ void SyncWebPanelTabFromWebView(MainWindow* win, WebviewWnd* wv, Str url, Str ti
         if (idx == win->webPanelActiveTab) {
             RememberPdfActiveTab(win);
             WriteBridgeJson(win);
+        }
+        if (t.pinned) {
+            RebuildPinStrip(win);
+            RelayoutWebPanel(win);
+            ScheduleFaviconPrefetch(win);
         }
     }
 }
@@ -3299,13 +3561,11 @@ LRESULT CALLBACK WndProcWebPanelBox(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return CallWindowProcW(gWebPanelBoxWndProc, hwnd, msg, wp, lp);
 }
 
-static const char* kIconRefresh =
-    R"(<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path fill="currentColor" d="M13.65 2.35A7.95 7.95 0 0 0 8 0a8 8 0 1 0 7.5 10h-1.6A6.4 6.4 0 1 1 8 1.6c1.5 0 2.9.5 4 1.4L9.5 5.5H16V0l-2.35 2.35z"/></svg>)";
-
-VirtIconButton* HeaderIconButton(const char* svg, Str tooltip, const VirtMouseHandler& onClick) {
+VirtIconButton* HeaderIconButton(const char* svg, Str tooltip, const VirtMouseHandler& onClick, int paletteIdx = -1) {
     int sz = DpiScale(kPinIconPx);
     auto* button = new VirtIconButton();
-    button->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz);
+    Color fg = paletteIdx >= 0 ? ChinesePaletteIconColor(paletteIdx) : ThemeWindowTextColor();
+    button->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz, fg);
     int pad = DpiScale(2);
     button->padding = Insets{0, pad, 0, pad};
     button->onClick = onClick;
@@ -3537,19 +3797,20 @@ void CreateWebPanel(MainWindow* win) {
     win->webPanelLabel = header.label;
     header.label->SetText(_TRA("AI"));
     win->webPanelBookmarksBtn = HeaderIconButton(gIconBookmarks, _TRA("书签（点击新建 Tab）"),
-                                                 MkFunc0(OnBookmarksButton, win));
-    win->webPanelTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnTabsButton, win));
+                                                 MkFunc0(OnBookmarksButton, win), 20);
+    win->webPanelTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnTabsButton, win), 21);
     win->webPanelHistoryBtn =
-        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebPanelHistoryButton, win));
+        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebPanelHistoryButton, win), 22);
     win->webPanelExtensionsBtn =
-        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebPanelExtensionsButton, win));
+        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebPanelExtensionsButton, win), 23);
     win->webPanelNotebookLmBtn =
-        HeaderIconButton(gIconNotebookLm, _TRA("当前 PDF 的 NotebookLM Tab"), MkFunc0(OnNotebookLmTabButton, win));
+        HeaderIconButton(gIconNotebookLm, _TRA("当前 PDF 的 NotebookLM Tab"), MkFunc0(OnNotebookLmTabButton, win), 24);
     win->webPanelFocusPdfBtn =
-        HeaderIconButton(gIconTargetFocus, _TRA("仅与当前 PDF 对话"), MkFunc0(OnFocusCurrentPdfNotebookLm, win));
-    win->webPanelRefreshBtn = HeaderIconButton(kIconRefresh, _TRA("Refresh"), MkFunc0(OnWebPanelRefresh, win));
+        HeaderIconButton(gIconTargetFocus, _TRA("仅与当前 PDF 对话"), MkFunc0(OnFocusCurrentPdfNotebookLm, win), 25);
+    win->webPanelRefreshBtn =
+        HeaderIconButton(gIconRefresh, _TRA("Refresh"), MkFunc0(OnWebPanelRefresh, win), 26);
 
-    // AI | bookmarks | tabs | history | extensions | notebooklm | focus-pdf | (spacer) | refresh | close
+    // AI | bookmarks | tabs | history | extensions | notebooklm | focus-pdf | | pinned-favicons | refresh | close
     if (len(header.box->children) > 0) {
         header.box->children[0].flex = 0;
         header.box->children.Pop();
@@ -3560,7 +3821,15 @@ void CreateWebPanel(MainWindow* win) {
     header.box->AddChild(win->webPanelExtensionsBtn);
     header.box->AddChild(win->webPanelNotebookLmBtn);
     header.box->AddChild(win->webPanelFocusPdfBtn);
-    header.box->AddChild(new Spacer(0, 0), 1);
+    auto* pinSep = new VirtLine();
+    pinSep->isVertical = true;
+    pinSep->thickness = 1;
+    pinSep->SetVisibility(Visibility::Collapse);
+    win->webPanelPinSep = pinSep;
+    header.box->AddChild(pinSep);
+    auto* pinStrip = new VirtHScrollStrip();
+    win->webPanelPinStrip = pinStrip;
+    header.box->AddChild(pinStrip, 1);
     header.box->AddChild(win->webPanelRefreshBtn);
     header.box->AddChild(header.closeBtn);
     win->webPanelHeader = header.box;
@@ -3597,6 +3866,8 @@ void CreateWebPanel(MainWindow* win) {
     win->uiState.aiChatVisible = false;
     win->aiAppliedBookId = 0;
     uitask::Post(MkFunc0(DeferredApplyLastBookAi, win), "ApplyLastBookAi");
+    // Bring up CDP :9224 as soon as the exe is ready (no need to open AI panel first).
+    uitask::Post(MkFunc0(EnsureWebViewCdpReady, win), "EnsureWebViewCdpReady");
 }
 
 void DestroyWebPanel(MainWindow* win) {
@@ -3605,6 +3876,8 @@ void DestroyWebPanel(MainWindow* win) {
     }
     SaveWebPanelTabs(win);
     FreePinClickCtxs();
+    delete win->webPanelCdpKeeper;
+    win->webPanelCdpKeeper = nullptr;
     for (WebPanelTab& tab : win->webPanelTabs) {
         delete tab.wv;
         tab.wv = nullptr;
@@ -3632,6 +3905,8 @@ void DestroyWebPanel(MainWindow* win) {
     win->webPanelNotebookLmBtn = nullptr;
     win->webPanelFocusPdfBtn = nullptr;
     win->webPanelRefreshBtn = nullptr;
+    win->webPanelPinSep = nullptr;
+    win->webPanelPinStrip = nullptr;
     win->webPanelWebViewSlot = nullptr;
     if (win->webPanelSplitter) {
         win->webPanelSplitter->onMove = {};
@@ -4139,30 +4414,31 @@ void UpdateWebPanelDpi(MainWindow* win, int dpi) {
     RelayoutWebPanel(win);
 }
 
-static void SetHeaderIcon(VirtIconButton* b, const char* svg) {
+static void SetHeaderIcon(VirtIconButton* b, const char* svg, int paletteIdx) {
     if (!b) {
         return;
     }
     int sz = DpiScale(kPinIconPx);
-    b->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz);
+    Color fg = ChinesePaletteIconColor(paletteIdx);
+    b->pixmap = GetCachedPixmapForSvg(Str(svg), sz, sz, fg);
 }
 
 void UpdateWebPanelIcons(MainWindow* win) {
     if (!win) {
         return;
     }
-    SetHeaderIcon(win->webPanelBookmarksBtn, gIconBookmarks);
-    SetHeaderIcon(win->webPanelTabsBtn, gIconTabs);
-    SetHeaderIcon(win->webPanelHistoryBtn, gIconHistory);
-    SetHeaderIcon(win->webPanelExtensionsBtn, gIconExtensions);
-    SetHeaderIcon(win->webPanelNotebookLmBtn, gIconNotebookLm);
-    SetHeaderIcon(win->webPanelFocusPdfBtn, gIconTargetFocus);
-    SetHeaderIcon(win->webPanelRefreshBtn, kIconRefresh);
-    SetHeaderIcon(win->webBrowserBookmarksBtn, gIconBookmarks);
-    SetHeaderIcon(win->webBrowserTabsBtn, gIconTabs);
-    SetHeaderIcon(win->webBrowserHistoryBtn, gIconHistory);
-    SetHeaderIcon(win->webBrowserExtensionsBtn, gIconExtensions);
-    SetHeaderIcon(win->webBrowserRefreshBtn, kIconRefresh);
+    SetHeaderIcon(win->webPanelBookmarksBtn, gIconBookmarks, 20);
+    SetHeaderIcon(win->webPanelTabsBtn, gIconTabs, 21);
+    SetHeaderIcon(win->webPanelHistoryBtn, gIconHistory, 22);
+    SetHeaderIcon(win->webPanelExtensionsBtn, gIconExtensions, 23);
+    SetHeaderIcon(win->webPanelNotebookLmBtn, gIconNotebookLm, 24);
+    SetHeaderIcon(win->webPanelFocusPdfBtn, gIconTargetFocus, 25);
+    SetHeaderIcon(win->webPanelRefreshBtn, gIconRefresh, 26);
+    SetHeaderIcon(win->webBrowserBookmarksBtn, gIconBookmarks, 20);
+    SetHeaderIcon(win->webBrowserTabsBtn, gIconTabs, 21);
+    SetHeaderIcon(win->webBrowserHistoryBtn, gIconHistory, 22);
+    SetHeaderIcon(win->webBrowserExtensionsBtn, gIconExtensions, 23);
+    SetHeaderIcon(win->webBrowserRefreshBtn, gIconRefresh, 26);
     if (win->hwndWebPanelBox) {
         HwndInvalidate(win->hwndWebPanelBox);
     }
@@ -4425,7 +4701,11 @@ void OnWebBrowserDocumentTitleChanged(void* ctx, WebviewWnd* sender, Str title) 
 
 void OnWebBrowserNavCompleted(void* ctx, Str url, bool success) {
     auto* win = (MainWindow*)ctx;
-    if (!IsMainWindowValid(win) || !success) {
+    if (!IsMainWindowValid(win)) {
+        return;
+    }
+    logf("WebBrowser nav done ok=%d url='%s' t=%llu\n", (int)success, url ? url : "", GetTickCount64());
+    if (!success) {
         return;
     }
     WebviewWnd* wv = win->webBrowserWebView;
@@ -4543,7 +4823,8 @@ WebviewWnd* CreateWebBrowserTabWebView(MainWindow* win, Str url) {
     // Spoof Chrome (not Edge) so Gemini / Google AI pages use the correct fonts.
     webView->emulateMobile = false;
     webView->userAgent = str::Dup(kChromeDesktopUserAgent);
-    webView->dedicatedBrowserArgs = str::Dup(fmt("--remote-debugging-port=%d", kLibraryCdpPort));
+    webView->dedicatedBrowserArgs =
+        str::Dup(fmt("--remote-debugging-port=%d --remote-allow-origins=*", kLibraryCdpPort));
     webView->enableBrowserExtensions = true;
     // Chrome overlays (Trancy, …) — LocalAppData, not git / not OneDrive.
     webView->browserExtensionsDir = str::Dup(BrowserExtensionsOverlayDirTemp());
@@ -4569,12 +4850,14 @@ void ActivateWebBrowserTabByIndex(MainWindow* win, int idx, bool remember) {
     }
     WebPanelTab& t = win->webBrowserTabs[idx];
     if (!t.wv && t.url) {
+        HibernateWebViews(win->webBrowserTabs, idx, kMaxLiveWebBrowserViews - 1);
         t.wv = CreateWebBrowserTabWebView(win, t.url);
         if (!t.wv) {
             return;
         }
     }
     win->webBrowserActiveTab = idx;
+    t.lastActiveMs = GetTickCount64();
     if (t.url) {
         str::ReplaceWithCopy(&win->webBrowserCurrentUrl, t.url);
     }
@@ -4599,6 +4882,7 @@ void CreateNewWebBrowserTab(MainWindow* win, Str url, Str title, Str forcedId = 
             return;
         }
     }
+    HibernateWebViews(win->webBrowserTabs, -1, kMaxLiveWebBrowserViews - 1);
     WebviewWnd* wv = CreateWebBrowserTabWebView(win, url);
     if (!wv) {
         return;
@@ -4607,6 +4891,7 @@ void CreateNewWebBrowserTab(MainWindow* win, Str url, Str title, Str forcedId = 
     tab.id = str::Dup(forcedId && forcedId.len > 0 ? forcedId : NewWebPanelTabIdTemp());
     tab.url = str::Dup(url);
     tab.title = str::Dup(title && title.len > 0 ? title : url);
+    tab.lastActiveMs = GetTickCount64();
     tab.wv = wv;
     win->webBrowserTabs.Append(tab);
     ActivateWebBrowserTabByIndex(win, len(win->webBrowserTabs) - 1, true);
@@ -4759,9 +5044,10 @@ void ShowWebBrowserTabsMenu(MainWindow* win) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kWebBrowserMenuCloseAll, CWStrTemp(_TRA("关闭全部 Tab")));
     }
-    POINT pt{};
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    LimitPopupMenuHeight(menu);
+    POINT pt = PointBelowPanelHeader(win, win->webBrowserHeader, win->hwndWebBrowserBox);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN, pt.x, pt.y, 0, win->hwndFrame,
+                             nullptr);
     DestroyMenu(menu);
     if (cmd == kWebBrowserMenuCloseAll) {
         for (int i = len(win->webBrowserTabs) - 1; i >= 0; i--) {
@@ -4787,9 +5073,10 @@ void OnWebBrowserBookmarks(MainWindow* win) {
     if (len(gBookmarks) == 0) {
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CWStrTemp(_TRA("(无书签)")));
     }
-    POINT pt{};
-    GetCursorPos(&pt);
-    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, win->hwndFrame, nullptr);
+    LimitPopupMenuHeight(menu);
+    POINT pt = PointBelowPanelHeader(win, win->webBrowserHeader, win->hwndWebBrowserBox);
+    int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_TOPALIGN, pt.x, pt.y, 0, win->hwndFrame,
+                             nullptr);
     DestroyMenu(menu);
     if (cmd >= 1 && cmd <= len(gBookmarks)) {
         CreateNewWebBrowserTab(win, gBookmarks[cmd - 1].url, gBookmarks[cmd - 1].title);
@@ -4936,13 +5223,14 @@ void CreateWebBrowserPanel(MainWindow* win) {
     win->webBrowserLabel = header.label;
     header.label->SetText(_TRA("Web"));
     win->webBrowserBookmarksBtn =
-        HeaderIconButton(gIconBookmarks, _TRA("书签（点击新建 Tab）"), MkFunc0(OnWebBrowserBookmarks, win));
-    win->webBrowserTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnWebBrowserTabs, win));
+        HeaderIconButton(gIconBookmarks, _TRA("书签（点击新建 Tab）"), MkFunc0(OnWebBrowserBookmarks, win), 20);
+    win->webBrowserTabsBtn = HeaderIconButton(gIconTabs, _TRA("Tab 列表"), MkFunc0(OnWebBrowserTabs, win), 21);
     win->webBrowserHistoryBtn =
-        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebBrowserHistoryButton, win));
+        HeaderIconButton(gIconHistory, _TRA("历史记录"), MkFunc0(OnWebBrowserHistoryButton, win), 22);
     win->webBrowserExtensionsBtn =
-        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebBrowserExtensionsButton, win));
-    win->webBrowserRefreshBtn = HeaderIconButton(kIconRefresh, _TRA("Refresh"), MkFunc0(OnWebBrowserRefresh, win));
+        HeaderIconButton(gIconExtensions, _TRA("扩展程序"), MkFunc0(OnWebBrowserExtensionsButton, win), 23);
+    win->webBrowserRefreshBtn =
+        HeaderIconButton(gIconRefresh, _TRA("Refresh"), MkFunc0(OnWebBrowserRefresh, win), 26);
 
     if (len(header.box->children) > 0) {
         header.box->children[0].flex = 0;
@@ -4978,6 +5266,43 @@ void CreateWebBrowserPanel(MainWindow* win) {
     DarkModeApplyToChildControls(win->hwndWebBrowserBox);
     win->uiState.webBrowserVisible = false;
     HwndSetVisible(win->hwndWebBrowserBox, false);
+    // Bring up CDP :9225 immediately so automation works without opening Web first.
+    uitask::Post(MkFunc0(EnsureWebViewCdpReady, win), "EnsureWebViewCdpReady");
+}
+
+void EnsureWebViewCdpReady(MainWindow* win) {
+    if (!win || !HasWebView() || !IsMainWindowValid(win)) {
+        return;
+    }
+    EnsureWebPanelDataLayout();
+    if (win->hwndWebPanelBox && !win->webPanelCdpKeeper) {
+        win->webPanelCdpKeeper = CreateWebPanelTabWebView(win, StrL("about:blank"));
+        if (win->webPanelCdpKeeper) {
+            win->webPanelCdpKeeper->SetControllerVisible(false);
+            win->webPanelCdpKeeper->SetIsVisible(false);
+            if (win->webPanelCdpKeeper->hwnd) {
+                ShowWindow(win->webPanelCdpKeeper->hwnd, SW_HIDE);
+            }
+            logf("EnsureWebViewCdpReady: AI CDP keeper on port %d\n",
+                 win->webPanelCdpPort > 0 ? win->webPanelCdpPort : kDefaultCdpPort);
+        } else {
+            logf("EnsureWebViewCdpReady: AI CDP keeper failed\n");
+        }
+    }
+    if (win->hwndWebBrowserBox && !win->webBrowserCdpKeeper) {
+        win->webBrowserCdpKeeper = CreateWebBrowserTabWebView(win, StrL("about:blank"));
+        if (win->webBrowserCdpKeeper) {
+            win->webBrowserCdpKeeper->SetControllerVisible(false, false);
+            win->webBrowserCdpKeeper->SetIsVisible(false);
+            if (win->webBrowserCdpKeeper->hwnd) {
+                ShowWindow(win->webBrowserCdpKeeper->hwnd, SW_HIDE);
+            }
+            logf("EnsureWebViewCdpReady: Web CDP keeper on port %d\n", kLibraryCdpPort);
+        } else {
+            logf("EnsureWebViewCdpReady: Web CDP keeper failed\n");
+        }
+    }
+    WriteBridgeJson(win);
 }
 
 void DestroyWebBrowserPanel(MainWindow* win) {
@@ -4985,6 +5310,8 @@ void DestroyWebBrowserPanel(MainWindow* win) {
         return;
     }
     SaveWebBrowserTabs(win);
+    delete win->webBrowserCdpKeeper;
+    win->webBrowserCdpKeeper = nullptr;
     for (WebPanelTab& tab : win->webBrowserTabs) {
         delete tab.wv;
         tab.wv = nullptr;

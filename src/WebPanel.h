@@ -54,5 +54,7 @@ TempStr ScriptsWebviewDirTemp();
 TempStr FindRepoScriptsWebviewTemp();
 void EnsureScriptsWebviewLayout();
 void WebPanelSpawnScript(Str scriptName, Str extraArgs = {});
+// Ensure AI(:9224) + Web(:9225) CDP browser processes are up (hidden about:blank keepers).
+void EnsureWebViewCdpReady(MainWindow* win);
 // -dbg-control TestWebPanel: show|hide|status|add|poll (AI/Cursor closed loop).
 TempStr WebPanelDbgControlTemp(Str action, Str a, Str b, int n1, int n2, int* exitCodeOut);

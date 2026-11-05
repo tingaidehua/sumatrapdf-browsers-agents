@@ -2704,9 +2704,9 @@ void VirtCloseButton::OnMouseLeave() {
 //--- LabelWithClose
 
 // what the old LabelWithCloseWnd custom control used, kept so the panels look
-// the same: a 16x16 ✕ with a bit of air around the text
-constexpr int kLabelPad = 2;
-constexpr int kCloseBtnDx = 16;
+// the same. Bumped ~+1/5 so Lucide header icons are easier to hit/read.
+constexpr int kLabelPad = 3;
+constexpr int kCloseBtnDx = 19;
 constexpr int kCloseBtnGapDx = 8;
 
 LabelWithClose NewLabelWithClose(HWND hwnd, PlatformFont* font, const VirtMouseHandler& onClose) {
@@ -2831,7 +2831,8 @@ VirtLine::~VirtLine() = default;
 
 Size VirtLine::GetIdealSize() {
     if (isVertical) {
-        return {thickness, 0};
+        // CrossCenter headers need a non-zero height or the line vanishes.
+        return {thickness, DpiScale(16)};
     }
     return {0, thickness};
 }

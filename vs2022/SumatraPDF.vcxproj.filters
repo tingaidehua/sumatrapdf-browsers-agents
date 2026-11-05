@@ -845,6 +845,9 @@
     <ClCompile Include="..\src\LibraryPanel.cpp">
       <Filter>src</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\ChinesePalette.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\LibraryReadingTracker.cpp">
       <Filter>src</Filter>
     </ClCompile>

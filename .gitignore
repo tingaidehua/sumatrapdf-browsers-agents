@@ -66,6 +66,9 @@ scripts/webview/package-lock.json.bak
 Thumbs.db
 Desktop.ini
 .DS_Store
+.cursor/
+.agents/
+.zed/
 *.tmp
 *.bak
 *.swp

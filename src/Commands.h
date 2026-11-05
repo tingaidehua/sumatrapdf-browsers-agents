@@ -297,7 +297,8 @@ enum {
     CmdShowHome = 486,
     CmdToggleLibrary = 487,
     CmdToggleWebSidebar = 488,
-    CmdNone = 489,
+    CmdShowDevInfo = 489,
+    CmdNone = 490,
 
     /* range for file history */
     CmdFileHistoryFirst,

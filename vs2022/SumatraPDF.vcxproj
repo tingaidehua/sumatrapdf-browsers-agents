@@ -1230,6 +1230,7 @@ cd ../out/rel64_prefast_asan &amp; if not exist InstallerData.dat ..\..\bin\Make
     <ClInclude Include="..\src\KeyboardHelp.h" />
     <ClInclude Include="..\src\Library.h" />
     <ClInclude Include="..\src\LibraryPanel.h" />
+    <ClInclude Include="..\src\ChinesePalette.h" />
     <ClInclude Include="..\src\ScriptManager.h" />
     <ClInclude Include="..\src\LibraryReadingTracker.h" />
     <ClInclude Include="..\src\LibraryStore.h" />
@@ -1372,6 +1373,7 @@ cd ../out/rel64_prefast_asan &amp; if not exist InstallerData.dat ..\..\bin\Make
     <ClCompile Include="..\src\AIChatCommon.cpp" />
     <ClCompile Include="..\src\AIChatPanel.cpp" />
     <ClCompile Include="..\src\WebPanel.cpp" />
+    <ClCompile Include="..\src\DevInfo.cpp" />
     <ClCompile Include="..\src\AIClaudeCode.cpp" />
     <ClCompile Include="..\src\AICodexBuild.cpp" />
     <ClCompile Include="..\src\AIGrokBuild.cpp" />
@@ -1463,6 +1465,7 @@ cd ../out/rel64_prefast_asan &amp; if not exist InstallerData.dat ..\..\bin\Make
     <ClCompile Include="..\src\KeyboardHelp_win.cpp" />
     <ClCompile Include="..\src\Library.cpp" />
     <ClCompile Include="..\src\LibraryPanel.cpp" />
+    <ClCompile Include="..\src\ChinesePalette.cpp" />
     <ClCompile Include="..\src\ScriptManager.cpp" />
     <ClCompile Include="..\src\LibraryReadingTracker.cpp" />
     <ClCompile Include="..\src\LibraryStore.cpp" />

@@ -3,7 +3,15 @@ import { bridgePaths, readJson, writeJson } from "./bridge.mjs";
 
 export async function probeCdpPorts(preferred = 9224) {
   const bridge = readJson(bridgePaths().bridge, {});
-  const ports = [bridge.cdpPort, preferred, 9224, 9223].filter(Boolean);
+  const ports = [
+    bridge.aiCdpPort,
+    bridge.webCdpPort,
+    bridge.cdpPort,
+    preferred,
+    9224,
+    9225,
+    9223,
+  ].filter(Boolean);
   const seen = new Set();
   const live = [];
   for (const p of ports) {

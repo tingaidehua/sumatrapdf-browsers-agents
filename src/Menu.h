@@ -22,6 +22,9 @@ void MenuCustomDrawItem(HWND, DRAWITEMSTRUCT*);
 
 HMENU BuildMenuFromDef(MenuDef* menuDefs, HMENU menu, BuildMenuCtx* ctx);
 void RemoveBadMenuSeparators(HMENU menu);
+// Cap popup/submenu height so long lists scroll instead of filling the screen.
+// maxDy<=0 → about half the monitor work area (at least ~12 menu rows).
+void LimitPopupMenuHeight(HMENU menu, int maxDy = 0);
 HMENU BuildMenu(MainWindow* win);
 void OnWindowContextMenu(MainWindow* win, int x, int y);
 void OnAboutContextMenu(MainWindow* win, int x, int y);

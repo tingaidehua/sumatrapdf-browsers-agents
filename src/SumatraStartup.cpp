@@ -2886,6 +2886,10 @@ ContinueOpenWindow:
     }
 
     StartSumatraControl(flags.controlPipeName);
+    // Always-on AI/plugin control pipe (CDP companion). Skip if already that name.
+    if (!flags.controlPipeName || !str::Eq(flags.controlPipeName, StrL("sumatrapdf-ai"))) {
+        StartSumatraControl(StrL("sumatrapdf-ai"));
+    }
 
     // on by default in debug builds; release builds can opt in by calling
     // StartUiHangDetector() themselves

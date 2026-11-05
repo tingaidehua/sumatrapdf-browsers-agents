@@ -37,6 +37,7 @@ static UINT_PTR gNoDocWhitelist[] = {
     CmdShowHome,
     CmdToggleLibrary,
     CmdToggleWebSidebar,
+    CmdShowDevInfo,
     CmdToggleFilePicker,
     CmdToggleBoolSetting,
     CmdNavigateFilesInFolder,

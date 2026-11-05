@@ -1,6 +1,9 @@
 /* Copyright 2022 the SumatraPDF project authors (see AUTHORS file).
    License: Simplified BSD (see COPYING.BSD) */
 
+// Built-in toolbar / sidebar icons are Lucide SVGs (https://lucide.dev).
+// When adding a new gIcon*, use Lucide: 24x24, stroke currentColor, width 1.5.
+
 extern const char* gIconFileOpen;
 extern const char* gIconPrint;
 extern const char* gIconPagePrev;
@@ -29,21 +32,26 @@ extern const char* gIconMatchWholeWord;
 extern const char* gIconHomeList;
 extern const char* gIconHomeThumbnails;
 extern const char* gIconPin;
+extern const char* gIconPinFilled;
 extern const char* gIconHome;
 extern const char* gIconLibrary;
 extern const char* gIconBookmarks;
 extern const char* gIconPlus;
 extern const char* gIconChat;
-// Target/aim — focus NotebookLM chat on the current PDF only.
+// Focus NotebookLM chat on the current PDF only (lucide: crosshair).
 extern const char* gIconTargetFocus;
-// NotebookLM tab switcher for the current PDF.
+// NotebookLM tab for the current PDF (lucide: notebook-pen).
 extern const char* gIconNotebookLm;
-// Browser-style tabs list for the AI WebPanel.
+// Browser-style tabs list (lucide: app-window).
 extern const char* gIconTabs;
-// From user asset 历史.svg — Chrome-like browsing history.
+// Browsing history (lucide: history).
 extern const char* gIconHistory;
-// Puzzle-piece — Chrome-like extensions menu (AI + Library Web headers).
+// Extensions menu (lucide: puzzle).
 extern const char* gIconExtensions;
+// Reload / refresh (lucide: refresh-cw).
+extern const char* gIconRefresh;
+// Developer / CDP info (lucide: info).
+extern const char* gIconInfo;
 
 struct Pixmap;
 

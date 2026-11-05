@@ -39,6 +39,8 @@ struct WebPanelTab {
     Str url;
     Str title; // document title (Chrome-like); falls back to host/url
     bool titleLocked = false; // true after user rename — stop following document.title
+    bool pinned = false;      // show favicon in AI header strip for quick switch
+    ULONGLONG lastActiveMs = 0; // GetTickCount64 for LRU hibernation
     WebviewWnd* wv = nullptr;
 };
 
@@ -318,11 +320,15 @@ struct MainWindow {
     VirtIconButton* webPanelNotebookLmBtn = nullptr;
     VirtIconButton* webPanelFocusPdfBtn = nullptr;
     VirtIconButton* webPanelRefreshBtn = nullptr;
+    VirtCtrl* webPanelPinSep = nullptr;   // vertical line after focus-pdf
+    VirtCtrl* webPanelPinStrip = nullptr; // pinned-tab favicon strip
     Vec<WebPanelTab> webPanelTabs;
     int webPanelActiveTab = -1;
     Str webPanelCurrentUrl;
     int webPanelCdpPort = 0;
     int webPanelDx = 0;
+    // Hidden about:blank WebView2 that keeps CDP :9224 alive even with zero AI tabs.
+    WebviewWnd* webPanelCdpKeeper = nullptr;
 
     // Center Web browser (library web books). Isolated tabs; same WebView2 env/CDP as AI.
     HWND hwndWebBrowserBox = nullptr;
@@ -341,6 +347,8 @@ struct MainWindow {
     Vec<WebPanelTab> webBrowserTabs;
     int webBrowserActiveTab = -1;
     Str webBrowserCurrentUrl;
+    // Hidden about:blank WebView2 that keeps CDP :9225 alive even with zero Web tabs.
+    WebviewWnd* webBrowserCdpKeeper = nullptr;
     HwndSlot* webBrowserSlot = nullptr;
 
     // Last library book shown (PDF or web); drives selection + per-book bindings.

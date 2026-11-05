@@ -51,6 +51,7 @@
 #include "PdfTools.h"
 #include "LibraryPanel.h"
 #include "WebPanel.h"
+#include "DevInfo.h"
 
 extern bool gIsStartup;
 TempStr FindHistoryResultTemp(int* exitCodeOut);
@@ -527,6 +528,10 @@ enum class ControlCmd : u16 {
     TestDpi = 71,
     TestLibrary = 72,
     TestWebPanel = 73,
+    // AI / plugin control surface (stable ids — do not renumber).
+    AiStatus = 100,
+    AiRunCmd = 101,
+    AiOpenWeb = 102,
 };
 
 enum class ControlArgType : u16 {
@@ -1483,6 +1488,48 @@ static void ExecuteControlRequest(ControlRequest* req) {
             int exitCode = 0;
             Str res = AIChatTestReplayResultTemp(userMsg, response, &exitCode);
             AppendTestResult(req, exitCode, res);
+            break;
+        }
+
+        case ControlCmd::AiStatus: {
+            MainWindow* win = len(gWindows) > 0 ? gWindows[0] : nullptr;
+            AppendTestResult(req, 0, BuildDevInfoTextTemp(win));
+            break;
+        }
+
+        case ControlCmd::AiRunCmd: {
+            Str name = StringArg(req, 0);
+            if (!name) {
+                AppendError(req, "AiRunCmd expects string commandName (e.g. CmdShowDevInfo)");
+                break;
+            }
+            int cmdId = GetCommandIdByName(name);
+            if (cmdId < 0) {
+                AppendError(req, fmt("unknown command '%s'", name));
+                break;
+            }
+            if (len(gWindows) == 0 || !gWindows[0]->hwndFrame) {
+                AppendError(req, "no main window");
+                break;
+            }
+            SendMessageW(gWindows[0]->hwndFrame, WM_COMMAND, (WPARAM)cmdId, 0);
+            AppendTestResult(req, 0, fmt("OK %s=%d", name, cmdId));
+            break;
+        }
+
+        case ControlCmd::AiOpenWeb: {
+            Str url = StringArg(req, 0);
+            Str title = StringArg(req, 1);
+            if (!url) {
+                AppendError(req, "AiOpenWeb expects string url [, string title]");
+                break;
+            }
+            if (len(gWindows) == 0) {
+                AppendError(req, "no main window");
+                break;
+            }
+            WebBrowserOpenUrlAsNewTab(gWindows[0], url, title);
+            AppendTestResult(req, 0, StrL("OK opened"));
             break;
         }
 

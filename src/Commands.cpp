@@ -304,6 +304,7 @@ static SeqStrings gCommandNames =
     "CmdShowHome\0"
     "CmdToggleLibrary\0"
     "CmdToggleWebSidebar\0"
+    "CmdShowDevInfo\0"
     "CmdNone\0"
     "\0";
 
@@ -596,6 +597,7 @@ static i32 gCommandIds[] = {
     CmdShowHome,
     CmdToggleLibrary,
     CmdToggleWebSidebar,
+    CmdShowDevInfo,
     CmdNone,
 };
 
@@ -888,6 +890,7 @@ SeqStrings gCommandDescriptions =
     "Show Home\0"
     "Toggle Library\0"
     "Toggle AI Sidebar\0"
+    "Developer Info\0"
     "Do nothing\0"
     "\0";
 // clang-format on

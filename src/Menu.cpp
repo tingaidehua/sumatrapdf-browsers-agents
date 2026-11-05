@@ -1470,6 +1470,28 @@ again3:
     }
 }
 
+void LimitPopupMenuHeight(HMENU menu, int maxDy) {
+    if (!menu) {
+        return;
+    }
+    if (maxDy <= 0) {
+        // ~half the work area, but keep a usable floor (~12 rows at 96dpi).
+        HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+        MONITORINFO miMon{};
+        miMon.cbSize = sizeof(miMon);
+        int workH = DpiScale(360);
+        if (GetMonitorInfoW(mon, &miMon)) {
+            workH = miMon.rcWork.bottom - miMon.rcWork.top;
+        }
+        maxDy = std::max(DpiScale(280), workH * 45 / 100);
+    }
+    MENUINFO mi{};
+    mi.cbSize = sizeof(mi);
+    mi.fMask = MIM_MAXHEIGHT;
+    mi.cyMax = (UINT)maxDy;
+    SetMenuInfo(menu, &mi);
+}
+
 static void MenuSetEnabledForDocumentCommands(HMENU menu, bool hasDocument) {
     for (int cmdId = (int)CmdFirst; cmdId <= (int)CmdLast; cmdId++) {
         if (!CmdWorksWithoutDocument(cmdId)) {
